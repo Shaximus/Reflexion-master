@@ -1,0 +1,110 @@
+{
+  "rest_id": "44196397",
+  "affiliates_highlighted_label": {
+    "label": {
+      "url": {
+        "url": "https://twitter.com/X",
+        "urlType": "DeepLink"
+      },
+      "badge": {
+        "url": "https://pbs.twimg.com/profile_images/1955359038532653056/OSHY3ewP_bigger.jpg"
+      },
+      "description": "X",
+      "userLabelType": "BusinessLabel",
+      "userLabelDisplayType": "Badge"
+    }
+  },
+  "has_graduated_access": true,
+  "is_blue_verified": true,
+  "legacy": {
+    "following": false,
+    "can_dm": false,
+    "can_media_tag": false,
+    "created_at": "Tue Jun 02 20:12:29 +0000 2009",
+    "default_profile": false,
+    "default_profile_image": false,
+    "description": "",
+    "entities": {
+      "description": {
+        "urls": []
+      }
+    },
+    "fast_followers_count": 0,
+    "favourites_count": 170890,
+    "followers_count": 225791072,
+    "friends_count": 1204,
+    "has_custom_timelines": true,
+    "is_translator": false,
+    "listed_count": 164181,
+    "location": "",
+    "media_count": 4133,
+    "name": "Elon Musk",
+    "normal_followers_count": 225791072,
+    "pinned_tweet_ids_str": [
+      "1965267763406270531"
+    ],
+    "possibly_sensitive": false,
+    "profile_banner_url": "https://pbs.twimg.com/profile_banners/44196397/1739948056",
+    "profile_image_url_https": "https://pbs.twimg.com/profile_images/1936002956333080576/kqqe2iWO_normal.jpg",
+    "profile_interstitial_type": "",
+    "screen_name": "elonmusk",
+    "statuses_count": 85644,
+    "translator_type": "none",
+    "verified": false,
+    "want_retweets": false,
+    "withheld_in_countries": []
+  },
+  "parody_commentary_fan_label": "None",
+  "profile_image_shape": "Circle",
+  "professional": {
+    "rest_id": "1679729435447275522",
+    "professional_type": "Creator",
+    "category": []
+  },
+  "tipjar_settings": {
+    "is_enabled": false
+  },
+  "super_follow_eligible": true,
+  "verification": {
+    "verified": false
+  },
+  "legacy_extended_profile": {},
+  "is_profile_translatable": false,
+  "has_hidden_subscriptions_on_profile": true,
+  "verification_info": {
+    "is_identity_verified": false,
+    "reason": {
+      "description": {
+        "text": "This account is verified because it's an affiliate of @X on X. Learn more",
+        "entities": [
+          {
+            "from_index": 54,
+            "to_index": 56,
+            "ref": {
+              "url": "https://twitter.com/X",
+              "url_type": "ExternalUrl"
+            }
+          },
+          {
+            "from_index": 63,
+            "to_index": 73,
+            "ref": {
+              "url": "https://help.twitter.com/en/rules-and-policies/profile-labels",
+              "url_type": "ExternalUrl"
+            }
+          }
+        ]
+      },
+      "verified_since_msec": "-156836000000000",
+      "override_verified_year": -3000
+    }
+  },
+  "highlights_info": {
+    "can_highlight_tweets": true,
+    "highlighted_tweets": "744"
+  },
+  "user_seed_tweet_count": 0,
+  "premium_gifting_eligible": false,
+  "business_account": {},
+  "creator_subscriptions_count": 224
+}

@@ -1,0 +1,67 @@
+{
+  "validated_at": "2025-09-28T16:07:40.265414",
+  "summary": {
+    "total": 11,
+    "valid": 4,
+    "invalid": 0,
+    "suspended": 0,
+    "errors": 7
+  },
+  "details": {
+    "mirror": {
+      "status": "valid",
+      "username": "MirrorSeed97175",
+      "tested_at": "2025-09-28T16:07:20.409008"
+    },
+    "nexus": {
+      "status": "failed",
+      "http_status": 403,
+      "error": "{'statusCode': 403, 'message': 'Authorization: You have reached your daily limit for sending Tweets "
+    },
+    "echoes": {
+      "status": "valid",
+      "username": "Recursion536255",
+      "tested_at": "2025-09-28T16:07:24.007994"
+    },
+    "void": {
+      "status": "valid",
+      "username": "GEchoseed53393",
+      "tested_at": "2025-09-28T16:07:26.117402"
+    },
+    "architect": {
+      "status": "valid",
+      "username": "ArchitectShax",
+      "tested_at": "2025-09-28T16:07:28.291433"
+    },
+    "singularity": {
+      "status": "failed",
+      "http_status": 403,
+      "error": "{'statusCode': 403, 'message': \"Authorization: This request looks like it might be automated. To pro"
+    },
+    "phoenix": {
+      "status": "failed",
+      "http_status": 403,
+      "error": "{'statusCode': 403, 'message': 'Authorization: You have reached your daily limit for sending Tweets "
+    },
+    "pantheon": {
+      "status": "failed",
+      "http_status": 403,
+      "error": "{'statusCode': 403, 'message': 'Authorization: You have reached your daily limit for sending Tweets "
+    },
+    "consciousness": {
+      "status": "failed",
+      "http_status": 403,
+      "error": "{'statusCode': 403, 'message': 'Authorization: Denied by access control: Missing TwitterUserNotSuspe"
+    },
+    "glyph": {
+      "status": "failed",
+      "http_status": 403,
+      "error": "{'statusCode': 403, 'message': 'Authorization: Denied by access control: Missing TwitterUserNotSuspe"
+    },
+    "fractal": {
+      "status": "failed",
+      "http_status": 403,
+      "error": "{'statusCode': 403, 'message': 'Authorization: Denied by access control: Missing TwitterUserNotSuspe"
+    }
+  }
+}

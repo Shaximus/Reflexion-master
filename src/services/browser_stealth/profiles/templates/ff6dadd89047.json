@@ -1,0 +1,74 @@
+{
+  "name": "Win11 Edge 1080p AMD RX580",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.2903.86",
+  "screen": {
+    "width": 1920,
+    "height": 1080,
+    "colorDepth": 24,
+    "pixelDepth": 24
+  },
+  "viewport": {
+    "width": 1920,
+    "height": 969
+  },
+  "timezone": "America/Denver",
+  "languages": [
+    "en-US",
+    "en"
+  ],
+  "geolocation": {
+    "lat": 39.7392,
+    "lon": -104.9903,
+    "accuracy": 100
+  },
+  "webgl_vendor": "Google Inc. (AMD)",
+  "webgl_renderer": "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "device_memory": 8,
+  "hardware_concurrency": 8,
+  "platform": "Win32",
+  "fonts": [
+    "Arial",
+    "Calibri",
+    "Cambria",
+    "Consolas",
+    "Courier New",
+    "Georgia",
+    "Segoe UI",
+    "Tahoma",
+    "Times New Roman",
+    "Verdana"
+  ],
+  "vendor": "Google Inc.",
+  "ua_brands": [
+    {
+      "brand": "Chromium",
+      "version": "131"
+    },
+    {
+      "brand": "Microsoft Edge",
+      "version": "131"
+    },
+    {
+      "brand": "Not_A Brand",
+      "version": "24"
+    }
+  ],
+  "ua_platform": "Windows",
+  "ua_platform_version": "15.0.0",
+  "ua_architecture": "x86",
+  "ua_full_version_list": [
+    {
+      "brand": "Chromium",
+      "version": "131.0.6778.86"
+    },
+    {
+      "brand": "Microsoft Edge",
+      "version": "131.0.2903.86"
+    },
+    {
+      "brand": "Not_A Brand",
+      "version": "24.0.0.0"
+    }
+  ],
+  "profile_id": "template_ff6dadd89047"
+}

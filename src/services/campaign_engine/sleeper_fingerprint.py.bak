@@ -1,0 +1,334 @@
+"""
+GOTCHA Campaign Sleeper Behavioral Fingerprint
+Generates per-account behavioral profiles that pass bot detection.
+
+Each account gets a deterministic fingerprint from its seed.
+Same seed = same behavioral profile. Different seed = different behavior.
+
+Design principle: invert every signal the BotRGCN flags as bot-like.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import random
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+from datetime import datetime, timedelta
+import logging
+
+logger = logging.getLogger("campaign.fingerprint")
+
+# Single source of truth for soul names
+from .campaign_config import SOUL_NAMES
+
+# Timezone offsets (North American range — where accounts "live")
+TIMEZONE_OFFSETS = list(range(-8, 4))  # PST to AST/EDT+ range
+
+# Topic pools for organic posting (non-Shield content)
+# DIVERSE — real humans aren't all tech workers. Mix of interests prevents
+# the swarm from looking like a coordinated tech-only bot network.
+ORGANIC_TOPICS = [
+    # Tech (keep some — these accounts DO eventually post about privacy)
+    "AI capabilities and limitations",
+    "open source software development",
+    "tech industry trends",
+    "cybersecurity fundamentals",
+    "programming languages and tools",
+    "startup ecosystem dynamics",
+    # Sports & fitness
+    "NBA basketball and game highlights",
+    "NFL football and fantasy leagues",
+    "UFC and combat sports",
+    "running and marathon training",
+    "gym workouts and fitness tips",
+    # Entertainment
+    "movies and film reviews",
+    "TV shows and streaming recommendations",
+    "video games and gaming culture",
+    "music discovery and playlists",
+    "anime and manga",
+    # Lifestyle
+    "cooking recipes and food culture",
+    "travel destinations and tips",
+    "personal finance and budgeting",
+    "home improvement and DIY projects",
+    "parenting and family life",
+    # Current events & culture
+    "science news and discoveries",
+    "space exploration and astronomy",
+    "climate and environmental news",
+    "book recommendations and reading",
+    "photography and visual art",
+    # Misc human interests
+    "pets and animal content",
+    "cars and automotive culture",
+    "fashion and style trends",
+    "mental health and wellness",
+    "local community events and news",
+]
+
+
+@dataclass
+class SleeperFingerprint:
+    """Behavioral profile for a sleeper account.
+
+    Every field is derived from account_seed for deterministic replay.
+    """
+    account_seed: str
+    soul_name: str
+
+    # Circadian rhythm
+    timezone_offset: int            # UTC offset (-8 to +3)
+    sleep_start_hour: int           # Local hour when posting stops (22-2)
+    wake_hour: int                  # Local hour when posting resumes (6-10)
+
+    # Posting rhythm
+    weekly_post_caps: List[int]     # 7 values, one per day of week (e.g., [2, 0, 1, 3, 0, 1, 2])
+    posting_jitter_minutes: int     # Random offset range for post timing (15-120)
+    min_gap_between_posts_hours: float  # Minimum hours between posts (2-8)
+
+    # Engagement behavior
+    daily_like_range: Tuple[int, int]    # (min, max) likes per active day
+    retweet_probability: float           # 0.03 - 0.12
+    reply_probability: float             # 0.02 - 0.08
+    follow_rate_per_day: Tuple[int, int] # (min, max) new follows per day
+
+    # Content preferences
+    preferred_topics: List[str]     # 3-5 topics from ORGANIC_TOPICS
+    original_content_ratio: float   # 0.7 - 0.95 (bots are low, humans are high)
+
+    # Anti-detection
+    skip_day_probability: float     # 0.15 - 0.35 (some days, don't post at all)
+    weekend_activity_modifier: float  # 0.3 - 0.8 (less active on weekends)
+    burst_avoidance: bool           # Always True — never post multiple times in quick succession
+
+    def is_awake(self, utc_hour: int) -> bool:
+        """Check if the account would be 'awake' at this UTC hour."""
+        local_hour = (utc_hour + self.timezone_offset) % 24
+
+        if self.sleep_start_hour > self.wake_hour:
+            # Normal case: sleep 23 -> wake 7
+            return not (self.sleep_start_hour <= local_hour or local_hour < self.wake_hour)
+        else:
+            # Edge case: sleep 1 -> wake 8
+            return not (self.sleep_start_hour <= local_hour < self.wake_hour)
+
+    def should_post_today(self, date: datetime) -> Tuple[bool, int]:
+        """Determine if account should post today and how many posts.
+
+        Returns: (should_post, max_posts_today)
+        """
+        rng = random.Random(f"{self.account_seed}:{date.strftime('%Y-%m-%d')}")
+
+        # Check skip day
+        if rng.random() < self.skip_day_probability:
+            return False, 0
+
+        # Get base cap for this day of week
+        day_idx = date.weekday()  # 0=Monday
+        base_cap = self.weekly_post_caps[day_idx]
+
+        # Weekend modifier
+        if day_idx >= 5:  # Saturday/Sunday
+            if rng.random() > self.weekend_activity_modifier:
+                return False, 0
+            base_cap = max(0, int(base_cap * self.weekend_activity_modifier))
+
+        if base_cap == 0:
+            return False, 0
+
+        return True, base_cap
+
+    def get_post_times(self, date: datetime, count: int) -> List[datetime]:
+        """Generate human-like post times for a given day.
+
+        Posts are spaced with minimum gaps and jitter, within awake hours.
+        """
+        rng = random.Random(f"{self.account_seed}:times:{date.strftime('%Y-%m-%d')}")
+
+        # Determine awake window in UTC
+        wake_utc = (self.wake_hour - self.timezone_offset) % 24
+        sleep_utc = (self.sleep_start_hour - self.timezone_offset) % 24
+
+        times = []
+        for i in range(count):
+            # Pick a random hour within awake window
+            if wake_utc < sleep_utc:
+                hour = rng.randint(wake_utc, sleep_utc - 1)
+            else:
+                # Wraps midnight
+                hours = list(range(wake_utc, 24)) + list(range(0, sleep_utc))
+                hour = rng.choice(hours) if hours else 12
+
+            minute = rng.randint(0, 59)
+            jitter = rng.randint(-self.posting_jitter_minutes, self.posting_jitter_minutes)
+
+            post_time = date.replace(hour=hour, minute=minute, second=rng.randint(0, 59))
+            post_time += timedelta(minutes=jitter)
+
+            # Clamp to same day
+            post_time = post_time.replace(
+                year=date.year, month=date.month, day=date.day
+            )
+
+            times.append(post_time)
+
+        # Sort and enforce minimum gap
+        times.sort()
+        min_gap = timedelta(hours=self.min_gap_between_posts_hours)
+        filtered = []
+        for t in times:
+            if not filtered or (t - filtered[-1]) >= min_gap:
+                filtered.append(t)
+
+        return filtered
+
+    def get_daily_likes(self, date: datetime) -> int:
+        """How many likes this account should do today."""
+        rng = random.Random(f"{self.account_seed}:likes:{date.strftime('%Y-%m-%d')}")
+
+        if date.weekday() >= 5:  # Weekend
+            modifier = self.weekend_activity_modifier
+        else:
+            modifier = 1.0
+
+        base = rng.randint(self.daily_like_range[0], self.daily_like_range[1])
+        return max(0, int(base * modifier))
+
+    def should_retweet(self, date: datetime, tweet_index: int) -> bool:
+        """Decide whether to retweet a specific tweet."""
+        rng = random.Random(f"{self.account_seed}:rt:{date.strftime('%Y-%m-%d')}:{tweet_index}")
+        return rng.random() < self.retweet_probability
+
+    def to_dict(self) -> Dict:
+        """Serialize fingerprint for storage."""
+        return {
+            "account_seed": self.account_seed,
+            "soul_name": self.soul_name,
+            "timezone_offset": self.timezone_offset,
+            "sleep_start_hour": self.sleep_start_hour,
+            "wake_hour": self.wake_hour,
+            "weekly_post_caps": self.weekly_post_caps,
+            "posting_jitter_minutes": self.posting_jitter_minutes,
+            "min_gap_between_posts_hours": self.min_gap_between_posts_hours,
+            "daily_like_range": list(self.daily_like_range),
+            "retweet_probability": self.retweet_probability,
+            "reply_probability": self.reply_probability,
+            "follow_rate_per_day": list(self.follow_rate_per_day),
+            "preferred_topics": self.preferred_topics,
+            "original_content_ratio": self.original_content_ratio,
+            "skip_day_probability": self.skip_day_probability,
+            "weekend_activity_modifier": self.weekend_activity_modifier,
+            "burst_avoidance": self.burst_avoidance,
+        }
+
+
+class FingerprintGenerator:
+    """Generates deterministic behavioral fingerprints from account seeds."""
+
+    @staticmethod
+    def generate(account_seed: str) -> SleeperFingerprint:
+        """Generate a complete behavioral fingerprint from a seed.
+
+        Every parameter is derived deterministically — same seed always
+        produces the same fingerprint.
+        """
+        rng = random.Random(hashlib.sha256(account_seed.encode()).hexdigest())
+
+        # Soul assignment
+        soul_name = rng.choice(SOUL_NAMES)
+
+        # Circadian rhythm
+        timezone_offset = rng.choice(TIMEZONE_OFFSETS)
+        sleep_start_hour = rng.randint(22, 26) % 24  # 22, 23, 0, 1, 2
+        wake_hour = rng.randint(6, 10)
+
+        # Posting rhythm — varied daily caps
+        # Key insight: real humans have VERY irregular posting
+        weekly_caps = []
+        for _ in range(7):
+            r = rng.random()
+            if r < 0.25:
+                weekly_caps.append(0)   # No posts this day
+            elif r < 0.55:
+                weekly_caps.append(1)   # One post
+            elif r < 0.80:
+                weekly_caps.append(2)   # Two posts
+            else:
+                weekly_caps.append(3)   # Three posts (rare)
+
+        posting_jitter = rng.randint(15, 120)
+        min_gap = rng.uniform(2.0, 8.0)
+
+        # Engagement — inverted from BotRGCN bot signals
+        daily_like_min = rng.randint(0, 3)
+        daily_like_max = daily_like_min + rng.randint(2, 6)
+        retweet_prob = rng.uniform(0.03, 0.12)  # Low (bots retweet a lot)
+        reply_prob = rng.uniform(0.02, 0.08)
+        follow_min = rng.randint(0, 2)
+        follow_max = follow_min + rng.randint(1, 3)
+
+        # Content preferences — 3-5 random topics
+        topic_count = rng.randint(3, 5)
+        preferred_topics = rng.sample(ORGANIC_TOPICS, topic_count)
+
+        # Human-like ratios
+        original_ratio = rng.uniform(0.70, 0.95)  # High original content
+        skip_day_prob = rng.uniform(0.15, 0.35)    # Sometimes just doesn't post
+        weekend_mod = rng.uniform(0.30, 0.80)      # Less active weekends
+
+        fingerprint = SleeperFingerprint(
+            account_seed=account_seed,
+            soul_name=soul_name,
+            timezone_offset=timezone_offset,
+            sleep_start_hour=sleep_start_hour,
+            wake_hour=wake_hour,
+            weekly_post_caps=weekly_caps,
+            posting_jitter_minutes=posting_jitter,
+            min_gap_between_posts_hours=round(min_gap, 1),
+            daily_like_range=(daily_like_min, daily_like_max),
+            retweet_probability=round(retweet_prob, 3),
+            reply_probability=round(reply_prob, 3),
+            follow_rate_per_day=(follow_min, follow_max),
+            preferred_topics=preferred_topics,
+            original_content_ratio=round(original_ratio, 2),
+            skip_day_probability=round(skip_day_prob, 2),
+            weekend_activity_modifier=round(weekend_mod, 2),
+            burst_avoidance=True,  # Always True
+        )
+
+        logger.info(
+            f"Generated fingerprint for {account_seed}: soul={soul_name}, "
+            f"tz={timezone_offset}, weekly_caps={weekly_caps}, "
+            f"topics={len(preferred_topics)}"
+        )
+
+        return fingerprint
+
+    @staticmethod
+    def generate_batch(seeds: List[str]) -> List[SleeperFingerprint]:
+        """Generate fingerprints for multiple accounts."""
+        return [FingerprintGenerator.generate(seed) for seed in seeds]
+
+    @staticmethod
+    def preview(seed: str) -> str:
+        """Generate a human-readable preview of a fingerprint."""
+        fp = FingerprintGenerator.generate(seed)
+        avg_daily = sum(fp.weekly_post_caps) / 7
+        lines = [
+            f"=== Fingerprint: {seed[:16]}... ===",
+            f"Soul: {fp.soul_name}",
+            f"Timezone: UTC{fp.timezone_offset:+d}",
+            f"Awake: {fp.wake_hour:02d}:00 - {fp.sleep_start_hour:02d}:00 local",
+            f"Weekly caps: {fp.weekly_post_caps} (avg {avg_daily:.1f}/day)",
+            f"Post jitter: ±{fp.posting_jitter_minutes} min",
+            f"Min gap: {fp.min_gap_between_posts_hours}h",
+            f"Likes/day: {fp.daily_like_range[0]}-{fp.daily_like_range[1]}",
+            f"RT prob: {fp.retweet_probability:.1%}",
+            f"Skip day prob: {fp.skip_day_probability:.0%}",
+            f"Weekend activity: {fp.weekend_activity_modifier:.0%}",
+            f"Original content: {fp.original_content_ratio:.0%}",
+            f"Topics: {', '.join(fp.preferred_topics[:3])}...",
+        ]
+        return "\n".join(lines)

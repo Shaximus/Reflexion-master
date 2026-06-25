@@ -1,0 +1,25 @@
+{
+  "max_retries": 3,
+  "screenshot_on_error": true,
+  "use_temp_email": true,
+  "email_config": {
+    "service": "tempmail"
+  },
+  "sms_config": {
+    "sms_activate_key": "",
+    "fivesim_key": "",
+    "textverified_key": ""
+  },
+  "proxy_config": {
+    "proxy_file": "proxies.txt",
+    "rotate_on_block": true
+  },
+  "behavioral_config": {
+    "use_markov": true,
+    "typing_errors": true
+  },
+  "vision_config": {
+    "detect_blocks": true,
+    "solve_captcha": false
+  }
+}

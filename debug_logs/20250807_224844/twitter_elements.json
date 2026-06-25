@@ -1,0 +1,12 @@
+{
+  "elements_found": {
+    "Create account button": true,
+    "Name input": false,
+    "Email input": false,
+    "Birth month": false,
+    "Birth day": false,
+    "Birth year": false
+  },
+  "url": "https://twitter.com/i/flow/signup",
+  "timestamp": "2025-08-07T22:48:54.886647"
+}

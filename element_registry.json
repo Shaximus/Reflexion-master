@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "last_updated": "2025-08-08T00:08:11.720819",
+  "ui_signatures": {},
+  "elements": {
+    "name_input": {
+      "css": [
+        "input[name='name']",
+        "input[autocomplete='name']"
+      ],
+      "aria": [
+        "[aria-label*='Name' i]"
+      ],
+      "placeholder": [
+        "input[placeholder*='Name' i]"
+      ]
+    },
+    "email_input": {
+      "css": [
+        "input[name='email']",
+        "input[type='email']"
+      ],
+      "aria": [
+        "[aria-label*='Email' i]"
+      ],
+      "placeholder": [
+        "input[placeholder*='Email' i]"
+      ]
+    },
+    "phone_input": {
+      "css": [
+        "input[name='phone_number']",
+        "input[type='tel']"
+      ]
+    },
+    "use_email_toggle": {
+      "text": [
+        "Use email instead",
+        "Use email"
+      ],
+      "css": [
+        "span:has-text('Use email')"
+      ]
+    },
+    "next_button": {
+      "text": [
+        "Next",
+        "Continue",
+        "Sign up"
+      ],
+      "css": [
+        "[data-testid*='next' i]",
+        "button:has-text('Next')"
+      ]
+    },
+    "verification_code_input": {
+      "css": [
+        "input[name='code']",
+        "input[data-testid*='code']"
+      ],
+      "aria": [
+        "[aria-label*='code' i]"
+      ]
+    },
+    "verify_button": {
+      "text": [
+        "Verify",
+        "Submit",
+        "Confirm"
+      ],
+      "css": [
+        "button:has-text('Verify')"
+      ]
+    }
+  },
+  "state_indicators": {
+    "LANDING": [
+      "Create account",
+      "Sign up for Twitter"
+    ],
+    "INITIAL_FORM": [
+      "Create your account",
+      "What's your name?"
+    ],
+    "DATE_OF_BIRTH": [
+      "Date of birth",
+      "When were you born"
+    ],
+    "CUSTOMIZE_EXPERIENCE": [
+      "Customize your experience"
+    ],
+    "VERIFICATION": [
+      "We sent you a code",
+      "Verify your email"
+    ],
+    "PASSWORD_CREATION": [
+      "You'll need a password",
+      "Create a password"
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "type": "manual_trigger",
+  "timestamp": "2025-08-07T01:32:57.220372",
+  "target_soul": "all",
+  "content": "Example trigger content",
+  "priority": "normal"
+}

@@ -1,0 +1,16 @@
+
+node_modules/
+venv/
+env/
+.env
+__pycache__/
+*.pyc
+*.zip
+*.tar.xz
+*.tar.gz
+*.iso
+.vscode/
+.cursor/
+*.log
+vllm*/
+\nvenv/\n

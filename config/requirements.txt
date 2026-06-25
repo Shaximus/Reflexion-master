@@ -1,0 +1,187 @@
+# REFLEXION ULTIMATE - PRODUCTION REQUIREMENTS
+# Python 3.10+ recommended
+
+# ═══════════════════════════════════════════════════════════════
+# CORE DEPENDENCIES
+# ═══════════════════════════════════════════════════════════════
+
+# Async and Networking
+aiohttp==3.9.5
+asyncio-throttle==1.0.2
+httpx==0.27.0
+requests==2.32.3
+urllib3==2.2.2
+
+# ═══════════════════════════════════════════════════════════════
+# BROWSER AUTOMATION & STEALTH
+# ═══════════════════════════════════════════════════════════════
+
+# Playwright Core
+playwright==1.45.0
+playwright-stealth==1.0.6
+
+# Selenium Fallback
+selenium==4.22.0
+undetected-chromedriver==3.5.5
+selenium-stealth==1.0.6
+
+# Browser Tools
+beautifulsoup4==4.12.3
+lxml==5.2.2
+html5lib==1.1
+
+# ═══════════════════════════════════════════════════════════════
+# AI/LLM INTEGRATIONS
+# ═══════════════════════════════════════════════════════════════
+
+# OpenAI
+openai==1.35.10
+
+# Anthropic (Claude)
+anthropic==0.31.2
+
+# Google (Gemini)
+google-generativeai==0.7.2
+google-api-python-client==2.138.0
+google-auth==2.32.0
+google-auth-httplib2==0.2.0
+
+# ═══════════════════════════════════════════════════════════════
+# SOCIAL MEDIA APIS
+# ═══════════════════════════════════════════════════════════════
+
+# X/Twitter
+tweepy==4.14.0
+
+# ═══════════════════════════════════════════════════════════════
+# IMAGE PROCESSING & AVATARS
+# ═══════════════════════════════════════════════════════════════
+
+Pillow==10.4.0
+numpy==1.26.4
+opencv-python==4.10.0.84
+scikit-image==0.24.0
+
+# ═══════════════════════════════════════════════════════════════
+# DATA STORAGE & PROCESSING
+# ═══════════════════════════════════════════════════════════════
+
+# Databases
+pymongo==4.8.0
+redis==5.0.7
+sqlalchemy==2.0.31
+
+# Data Processing
+pandas==2.2.2
+numpy==1.26.4
+
+# ═══════════════════════════════════════════════════════════════
+# SECURITY & ENCRYPTION
+# ═══════════════════════════════════════════════════════════════
+
+cryptography==41.0.7
+pycryptodome==3.20.0
+python-jose==3.3.0
+passlib==1.7.4
+bcrypt==4.1.3
+
+# ═══════════════════════════════════════════════════════════════
+# CAPTCHA SOLVING
+# ═══════════════════════════════════════════════════════════════
+
+# 2captcha-python==1.2.5  # Uncomment if using 2captcha
+# anticaptchaofficial==1.0.60  # Uncomment if using anticaptcha
+
+# ═══════════════════════════════════════════════════════════════
+# UTILITIES
+# ═══════════════════════════════════════════════════════════════
+
+# Environment & Config
+python-dotenv==1.0.1
+pyyaml==6.0.1
+toml==0.10.2
+
+# Logging & Monitoring
+loguru==0.7.2
+colorlog==6.8.2
+rich==13.7.1
+
+# Date/Time
+python-dateutil==2.9.0
+pytz==2024.1
+tzlocal==5.2
+
+# Text Processing
+faker==26.0.0
+textblob==0.18.0
+emoji==2.12.1
+
+# File Handling
+pathlib2==2.3.7
+watchdog==4.0.1
+
+# ═══════════════════════════════════════════════════════════════
+# DEVELOPMENT & TESTING
+# ═══════════════════════════════════════════════════════════════
+
+pytest==8.3.1
+pytest-asyncio==0.23.8
+pytest-cov==5.0.0
+black==24.4.2
+flake8==7.1.0
+mypy==1.11.0
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIONAL DEPENDENCIES
+# ═══════════════════════════════════════════════════════════════
+
+# Performance
+uvloop==0.19.0  # Linux/Mac only, comment out for Windows
+orjson==3.10.6  # Fast JSON
+
+# Proxy Management
+# proxy-rotation==0.4.1  # Uncomment if using proxy rotation
+# residential-proxy==1.0.0  # Uncomment if using residential proxies
+
+# SMS Services (uncomment as needed)
+# smsactivate==1.3  # For sms-activate.ru
+# fivesim==1.0.0  # For 5sim.net
+
+# Additional ML/Analysis (uncomment if needed)
+# transformers==4.42.4  # For advanced NLP
+# torch==2.3.1  # For neural networks
+# tensorflow==2.16.2  # Alternative to PyTorch
+
+# ═══════════════════════════════════════════════════════════════
+# WINDOWS SPECIFIC
+# ═══════════════════════════════════════════════════════════════
+
+# Windows users may need:
+# pywin32==306  # Uncomment for Windows
+# windows-curses==2.3.3  # Uncomment for Windows terminal support
+
+# ═══════════════════════════════════════════════════════════════
+# NOTES
+# ═══════════════════════════════════════════════════════════════
+
+# Installation order matters for some packages:
+# 1. pip install --upgrade pip setuptools wheel
+# 2. pip install -r requirements.txt
+# 3. playwright install chromium  # After installing playwright
+
+# For production deployment:
+# - Use virtual environment: python -m venv venv
+# - Activate: venv\Scripts\activate (Windows) or source venv/bin/activate (Linux/Mac)
+# - Install: pip install -r requirements.txt
+
+# For GPU acceleration (optional):
+# - Install CUDA toolkit for your system
+# - Replace torch with: torch==2.3.1+cu121 (for CUDA 12.1)
+
+# For M1/M2 Macs:
+# - Some packages may need: pip install --no-binary :all: <package>
+
+# Security note:
+# - Never commit .env or .secrets/ to version control
+# - Use environment variables for API keys
+# - Rotate proxy credentials regularly

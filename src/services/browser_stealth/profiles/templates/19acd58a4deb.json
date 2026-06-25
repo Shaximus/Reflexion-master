@@ -1,0 +1,81 @@
+{
+  "name": "macOS Chrome M3 Germany",
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+  "screen": {
+    "width": 2560,
+    "height": 1600,
+    "colorDepth": 30,
+    "pixelDepth": 30
+  },
+  "viewport": {
+    "width": 1440,
+    "height": 821
+  },
+  "timezone": "Europe/Berlin",
+  "languages": [
+    "de-DE",
+    "de",
+    "en-US",
+    "en"
+  ],
+  "geolocation": {
+    "lat": 52.52,
+    "lon": 13.405,
+    "accuracy": 100
+  },
+  "webgl_vendor": "Google Inc. (Apple)",
+  "webgl_renderer": "ANGLE (Apple, Apple M3, OpenGL 4.1)",
+  "device_memory": 8,
+  "hardware_concurrency": 8,
+  "platform": "MacIntel",
+  "fonts": [
+    "Arial",
+    "Courier",
+    "Courier New",
+    "Geneva",
+    "Georgia",
+    "Helvetica",
+    "Helvetica Neue",
+    "Lucida Grande",
+    "Monaco",
+    "Palatino",
+    "San Francisco",
+    "Times",
+    "Times New Roman",
+    "Trebuchet MS",
+    "Verdana"
+  ],
+  "vendor": "Google Inc.",
+  "ua_brands": [
+    {
+      "brand": "Chromium",
+      "version": "132"
+    },
+    {
+      "brand": "Google Chrome",
+      "version": "132"
+    },
+    {
+      "brand": "Not_A Brand",
+      "version": "24"
+    }
+  ],
+  "ua_platform": "macOS",
+  "ua_platform_version": "15.0.0",
+  "ua_architecture": "arm",
+  "ua_full_version_list": [
+    {
+      "brand": "Chromium",
+      "version": "132.0.6834.57"
+    },
+    {
+      "brand": "Google Chrome",
+      "version": "132.0.6834.57"
+    },
+    {
+      "brand": "Not_A Brand",
+      "version": "24.0.0.0"
+    }
+  ],
+  "profile_id": "template_19acd58a4deb"
+}

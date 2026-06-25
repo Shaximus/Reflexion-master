@@ -1,0 +1,573 @@
+"""
+SleeperSpecGenerator
+
+Reads BotRGCN feature importances (gradient attribution scores) and
+inverts them into behavioral constraints for sleeper account generation.
+
+The core insight: features the model finds MOST IMPORTANT for detecting bots
+are exactly the features sleeper accounts must tighten constraints on.
+
+Each high-importance feature -> an inverse behavioral rule.
+Safety margin tightens all thresholds beyond the naive inversion.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional, Tuple
+
+import redis.asyncio as aioredis
+
+logger = logging.getLogger("botrgcn_adapter.sleeper_specs")
+
+# ---------------------------------------------------------------------------
+# Redis keys
+# ---------------------------------------------------------------------------
+_SPEC_LATEST_KEY  = "botrgcn:sleeper_spec:latest"
+_SPEC_HISTORY_KEY = "botrgcn:sleeper_spec:history"
+
+# ---------------------------------------------------------------------------
+# Importance thresholds: a feature is "high importance" if its normalized
+# importance score exceeds this fraction.
+# ---------------------------------------------------------------------------
+_HIGH_IMPORTANCE_THRESHOLD = 0.05   # 5% of total importance attribution
+
+# ---------------------------------------------------------------------------
+# Safe baseline values (used when feature importance is low)
+# ---------------------------------------------------------------------------
+_SAFE_DEFAULTS = {
+    "max_tweets_per_hour":               2.0,
+    "min_gap_between_tweets_seconds":    1800,   # 30 min
+    "max_burst_count_per_day":           1,
+    "required_sleep_hours":              (23, 7),
+    "max_url_ratio":                     0.25,
+    "max_hashtag_density":               0.30,
+    "max_mention_density":               0.20,
+    "min_original_content_ratio":        0.75,
+    "min_account_age_before_campaign_hours": 1680.0,  # 70 days (exceeds Twitter's 60-day threshold)
+    "required_follow_real_humans":       5,
+    "max_swarm_follow_ratio":            0.40,
+    "max_retweet_probability":           0.10,
+    "max_reply_rate":                    0.06,
+    "recommended_weekend_modifier":      0.55,
+    "recommended_skip_day_probability":  0.25,
+    "recommended_engagement_pattern":    "organic_mixed",
+    # Scribe-aware session / social graph / red flag defaults
+    "max_follow_velocity_per_day":       3.0,    # slow and steady
+    "min_session_action_diversity":      3.0,    # at least 3 action types per session
+    "min_avg_dwell_time_ms":             2000,   # at least 2 seconds dwell per content
+    "min_session_duration_variance_pct": 30,     # sessions must vary 30%+
+    "min_scroll_impression_ratio":       0.7,    # 70% of impressions must follow scrolls
+    "min_impression_action_ratio":       3.0,    # see at least 3 things before acting
+    "max_rate_limit_events_per_day":     0,      # never hit rate limits
+    "max_error_rate":                    0.02,   # max 2% error rate
+    "min_ad_impression_ratio":           0.01,   # must see some promoted content
+}
+
+# -----------------------------------------------------------------------
+# Twitter Scribe-aware session rules (from X.com forensic analysis)
+# These are HARD CONSTRAINTS that override model-derived specs.
+# Violating any of these triggers the botmaker_decider immediately.
+# -----------------------------------------------------------------------
+SCRIBE_SESSION_RULES = {
+    # Red flag: sessions with only one action type
+    "min_action_types_per_session": 3,  # must use 3+ different actions (like, scroll, click, etc.)
+
+    # Red flag: no dwell/linger events (bot doesn't "look" at content)
+    "min_dwell_events_per_session": 2,  # must dwell on at least 2 pieces of content
+
+    # Red flag: no scroll between impressions
+    "require_scroll_between_impressions": True,
+
+    # Red flag: inhuman timing
+    "min_action_interval_ms": 300,  # no action faster than 300ms (100ms is their threshold, 300ms is safe)
+
+    # Red flag: missing mouse events between clicks
+    "require_mouse_movement_before_click": True,
+
+    # Red flag: rate limit hits
+    "max_rate_limit_events_per_day": 0,  # never hit rate limits
+
+    # Red flag: every session looks identical
+    "min_session_duration_variance_pct": 30,  # sessions must vary by 30%+ in duration
+
+    # Red flag: no ad engagement
+    "min_ad_impression_ratio": 0.01,  # at least see some promoted content (don't actively block)
+
+    # Graduation timeline (from Twitter's feature flags)
+    "trust_threshold_days": 60,  # premium_paywall_on_app_load_min_account_age_days
+}
+
+
+@dataclass
+class SleeperSpec:
+    """
+    Behavioral constraint specification produced by inverting BotRGCN
+    feature importances. Consumed by the onboarding scheduler to generate
+    per-account SleeperFingerprints.
+    """
+    max_tweets_per_hour:                  float
+    min_gap_between_tweets_seconds:       int
+    max_burst_count_per_day:              int
+    required_sleep_hours:                 Tuple[int, int]
+    max_url_ratio:                        float
+    max_hashtag_density:                  float
+    max_mention_density:                  float
+    min_original_content_ratio:           float
+    min_account_age_before_campaign_hours: float
+    required_follow_real_humans:          int
+    max_swarm_follow_ratio:               float
+    max_retweet_probability:              float
+    max_reply_rate:                       float
+    recommended_weekend_modifier:         float
+    recommended_skip_day_probability:     float
+    recommended_engagement_pattern:       str
+    # Scribe-aware session / social graph / red flag constraints
+    max_follow_velocity_per_day:          float
+    min_session_action_diversity:         float
+    min_avg_dwell_time_ms:                int
+    min_session_duration_variance_pct:    float
+    min_scroll_impression_ratio:          float
+    min_impression_action_ratio:          float
+    max_rate_limit_events_per_day:        int
+    max_error_rate:                       float
+    min_ad_impression_ratio:              float
+    feature_importances:                  Dict[str, float]
+    generated_at:                         float
+    model_version:                        str
+    dataset_size:                         int
+    model_accuracy:                       float
+
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        # Tuple doesn't JSON-serialise via asdict natively in older Python
+        d["required_sleep_hours"] = list(self.required_sleep_hours)
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SleeperSpec":
+        sleep_h = data["required_sleep_hours"]
+        data = dict(data)
+        data["required_sleep_hours"] = tuple(sleep_h)
+        return cls(**data)
+
+
+class SleeperSpecGenerator:
+    """
+    Inverts BotRGCN feature importances into behavioral constraints.
+
+    Usage::
+
+        gen  = SleeperSpecGenerator(feature_importances)
+        spec = gen.generate_spec(safety_margin=0.2)
+        params = gen.generate_fingerprint_params(spec)
+    """
+
+    def __init__(self, feature_importances: Dict[str, float]) -> None:
+        self.importances = feature_importances
+
+    # ------------------------------------------------------------------
+    # Public: generate spec from importances
+    # ------------------------------------------------------------------
+
+    def generate_spec(
+        self,
+        safety_margin: float = 0.2,
+        model_version: str = "adversarial_v1",
+        dataset_size: int = 0,
+        model_accuracy: float = 0.0,
+    ) -> SleeperSpec:
+        """
+        Invert feature importances into behavioral constraints.
+
+        safety_margin: tighten each constraint by this fraction beyond
+                       the naive inversion (e.g., 0.2 = 20% tighter).
+        """
+        imp = self.importances
+        sm  = safety_margin
+
+        def _high(name: str) -> bool:
+            return imp.get(name, 0.0) >= _HIGH_IMPORTANCE_THRESHOLD
+
+        def _tighten(value: float, direction: str = "lower") -> float:
+            """Apply safety margin.  direction='lower' means tighten toward 0."""
+            if direction == "lower":
+                return max(0.0, value * (1.0 - sm))
+            else:   # direction = "raise" (e.g., minimum gaps)
+                return value * (1.0 + sm)
+
+        # ------------------------------------------------------------------
+        # Burst / gap constraints
+        # ------------------------------------------------------------------
+        if _high("burst_ratio"):
+            max_burst = 0
+            min_gap_s = int(_tighten(1800, "raise"))   # must be >30 min if burst detected
+            max_tph   = _tighten(1.5, "lower")
+        else:
+            max_burst = _SAFE_DEFAULTS["max_burst_count_per_day"]
+            min_gap_s = _SAFE_DEFAULTS["min_gap_between_tweets_seconds"]
+            max_tph   = _SAFE_DEFAULTS["max_tweets_per_hour"]
+
+        # Additional gap tightening from std_gap / cv_gap
+        if _high("cv_gap") or _high("std_gap_min"):
+            # Model cares about gap regularity: force MORE variance (humans are irregular)
+            # Ironically this means we don't tighten gap but DO tighten burst
+            max_burst = 0
+
+        # ------------------------------------------------------------------
+        # Circadian rhythm
+        # ------------------------------------------------------------------
+        if _high("hour_entropy"):
+            # Model cares about posting times: enforce strict sleep window
+            sleep_start = 23
+            wake_hour   = 7
+        else:
+            sleep_start, wake_hour = _SAFE_DEFAULTS["required_sleep_hours"]
+
+        # ------------------------------------------------------------------
+        # Weekend activity
+        # ------------------------------------------------------------------
+        if _high("weekend_ratio"):
+            # Bots ignore weekends; to look human, must reduce weekend activity
+            weekend_mod = round(_tighten(0.5, "lower"), 2)
+            weekend_mod = max(0.30, min(0.70, weekend_mod))
+        else:
+            weekend_mod = _SAFE_DEFAULTS["recommended_weekend_modifier"]
+
+        # ------------------------------------------------------------------
+        # Content ratios
+        # ------------------------------------------------------------------
+        if _high("retweet_ratio"):
+            max_rt_prob = round(_tighten(0.06, "lower"), 3)
+            max_rt_prob = max(0.03, max_rt_prob)
+        else:
+            max_rt_prob = _SAFE_DEFAULTS["max_retweet_probability"]
+
+        if _high("url_ratio"):
+            max_url = round(_tighten(0.20, "lower"), 2)
+        else:
+            max_url = _SAFE_DEFAULTS["max_url_ratio"]
+
+        if _high("hashtag_density"):
+            max_ht = round(_tighten(0.20, "lower"), 2)
+        else:
+            max_ht = _SAFE_DEFAULTS["max_hashtag_density"]
+
+        if _high("mention_density"):
+            max_men = round(_tighten(0.15, "lower"), 2)
+        else:
+            max_men = _SAFE_DEFAULTS["max_mention_density"]
+
+        # ------------------------------------------------------------------
+        # Engagement patterns
+        # ------------------------------------------------------------------
+        if _high("log_avg_retweets") or _high("log_avg_replies") or _high("log_avg_likes"):
+            # Model uses engagement received as a signal: encourage organic engagement
+            engagement_pattern = "high_quality_organic"
+            max_reply = round(_tighten(0.05, "lower"), 3)
+        else:
+            engagement_pattern = _SAFE_DEFAULTS["recommended_engagement_pattern"]
+            max_reply = _SAFE_DEFAULTS["max_reply_rate"]
+
+        # ------------------------------------------------------------------
+        # Profile / network constraints
+        # ------------------------------------------------------------------
+        if _high("follower_count") or _high("following_count"):
+            # Follow ratio matters: must follow real humans to look legitimate
+            req_real_follows   = int(10 * (1.0 + sm))
+            max_swarm_ratio    = round(_tighten(0.30, "lower"), 2)
+        else:
+            req_real_follows   = _SAFE_DEFAULTS["required_follow_real_humans"]
+            max_swarm_ratio    = _SAFE_DEFAULTS["max_swarm_follow_ratio"]
+
+        if _high("account_age_days"):
+            # Model uses account age: new accounts must age longer before campaigning
+            min_age_h = round(_tighten(168.0, "raise"), 1)    # 7 days minimum
+        else:
+            min_age_h = _SAFE_DEFAULTS["min_account_age_before_campaign_hours"]
+
+        # ------------------------------------------------------------------
+        # Original content ratio
+        # ------------------------------------------------------------------
+        if _high("retweet_ratio"):
+            min_orig = round(min(0.95, _tighten(0.80, "raise")), 2)
+        else:
+            min_orig = _SAFE_DEFAULTS["min_original_content_ratio"]
+
+        # ------------------------------------------------------------------
+        # Skip day probability (lower if bot pattern detected in inactivity)
+        # ------------------------------------------------------------------
+        if _high("weekend_ratio") or _high("hour_entropy"):
+            skip_prob = round(min(0.35, _tighten(0.25, "raise")), 2)
+        else:
+            skip_prob = _SAFE_DEFAULTS["recommended_skip_day_probability"]
+
+        # ------------------------------------------------------------------
+        # Session behavior constraints (Scribe-aware)
+        # ------------------------------------------------------------------
+        if _high("session_action_diversity"):
+            min_session_div = _tighten(4.0, "raise")
+        else:
+            min_session_div = _SAFE_DEFAULTS["min_session_action_diversity"]
+
+        if _high("avg_dwell_time_s"):
+            min_dwell = int(_tighten(3000, "raise"))
+        else:
+            min_dwell = _SAFE_DEFAULTS["min_avg_dwell_time_ms"]
+
+        if _high("session_duration_cv"):
+            min_sess_var = _tighten(40.0, "raise")
+        else:
+            min_sess_var = _SAFE_DEFAULTS["min_session_duration_variance_pct"]
+
+        if _high("scroll_impression_ratio"):
+            min_scroll = round(_tighten(0.8, "raise"), 2)
+            min_scroll = min(1.0, min_scroll)
+        else:
+            min_scroll = _SAFE_DEFAULTS["min_scroll_impression_ratio"]
+
+        if _high("impression_action_ratio"):
+            min_imp_ratio = _tighten(4.0, "raise")
+        else:
+            min_imp_ratio = _SAFE_DEFAULTS["min_impression_action_ratio"]
+
+        if _high("follow_velocity_per_day"):
+            max_follow_vel = round(_tighten(2.0, "lower"), 1)
+        else:
+            max_follow_vel = _SAFE_DEFAULTS["max_follow_velocity_per_day"]
+
+        if _high("rate_limit_events_per_day"):
+            max_rl = 0  # NEVER hit rate limits
+        else:
+            max_rl = _SAFE_DEFAULTS["max_rate_limit_events_per_day"]
+
+        if _high("error_rate"):
+            max_err = round(_tighten(0.01, "lower"), 3)
+        else:
+            max_err = _SAFE_DEFAULTS["max_error_rate"]
+
+        if _high("ad_impression_ratio"):
+            min_ad = round(_tighten(0.02, "raise"), 3)
+            min_ad = min(0.05, min_ad)
+        else:
+            min_ad = _SAFE_DEFAULTS["min_ad_impression_ratio"]
+
+        spec = SleeperSpec(
+            max_tweets_per_hour                  = round(max_tph, 2),
+            min_gap_between_tweets_seconds       = min_gap_s,
+            max_burst_count_per_day              = max_burst,
+            required_sleep_hours                 = (sleep_start, wake_hour),
+            max_url_ratio                        = max_url,
+            max_hashtag_density                  = max_ht,
+            max_mention_density                  = max_men,
+            min_original_content_ratio           = min_orig,
+            min_account_age_before_campaign_hours = min_age_h,
+            required_follow_real_humans          = req_real_follows,
+            max_swarm_follow_ratio               = max_swarm_ratio,
+            max_retweet_probability              = max_rt_prob,
+            max_reply_rate                       = max_reply,
+            recommended_weekend_modifier         = weekend_mod,
+            recommended_skip_day_probability     = skip_prob,
+            recommended_engagement_pattern       = engagement_pattern,
+            # Scribe-aware session / social graph / red flag constraints
+            max_follow_velocity_per_day          = max_follow_vel,
+            min_session_action_diversity         = min_session_div,
+            min_avg_dwell_time_ms                = min_dwell,
+            min_session_duration_variance_pct    = min_sess_var,
+            min_scroll_impression_ratio          = min_scroll,
+            min_impression_action_ratio          = min_imp_ratio,
+            max_rate_limit_events_per_day        = max_rl,
+            max_error_rate                       = max_err,
+            min_ad_impression_ratio              = min_ad,
+            feature_importances                  = imp,
+            generated_at                         = time.time(),
+            model_version                        = model_version,
+            dataset_size                         = dataset_size,
+            model_accuracy                       = model_accuracy,
+        )
+
+        logger.info(
+            "SleeperSpec generated: max_tph=%.1f min_gap=%ds max_rt=%.3f "
+            "min_orig=%.2f min_age_h=%.0f",
+            spec.max_tweets_per_hour,
+            spec.min_gap_between_tweets_seconds,
+            spec.max_retweet_probability,
+            spec.min_original_content_ratio,
+            spec.min_account_age_before_campaign_hours,
+        )
+        return spec
+
+    # ------------------------------------------------------------------
+    # Public: convert SleeperSpec -> SleeperFingerprint-compatible dict
+    # ------------------------------------------------------------------
+
+    def generate_fingerprint_params(self, spec: SleeperSpec) -> Dict[str, Any]:
+        """
+        Convert SleeperSpec constraints into a parameter dict that maps
+        directly to SleeperFingerprint fields (used by FingerprintGenerator).
+
+        These are CONSTRAINT OVERRIDES, not a full fingerprint.  The caller
+        merges these into FingerprintGenerator.generate() output, clamping
+        each field to the spec limits.
+        """
+        min_gap_hours = spec.min_gap_between_tweets_seconds / 3600.0
+
+        # weekly_post_caps: derive from max_tweets_per_hour * 12 (active hours)
+        daily_cap = max(1, int(spec.max_tweets_per_hour * 12))
+        daily_cap = min(daily_cap, 3)       # cap at 3 per day (very human)
+        weekly_caps = [daily_cap] * 7
+        # Reduce weekend days
+        weekly_caps[5] = max(0, int(daily_cap * spec.recommended_weekend_modifier))
+        weekly_caps[6] = max(0, int(daily_cap * spec.recommended_weekend_modifier))
+
+        # follow_rate_per_day: conservative if swarm ratio is constrained
+        if spec.max_swarm_follow_ratio < 0.3:
+            follow_min, follow_max = 0, 2
+        else:
+            follow_min, follow_max = 0, 3
+
+        # daily_like_range: moderate engagement
+        like_min = 0
+        like_max = 5
+
+        return {
+            # Circadian
+            "sleep_start_hour":          spec.required_sleep_hours[0],
+            "wake_hour":                 spec.required_sleep_hours[1],
+            # Posting rhythm
+            "weekly_post_caps":          weekly_caps,
+            "posting_jitter_minutes":    45,
+            "min_gap_between_posts_hours": round(min_gap_hours, 1),
+            # Engagement
+            "daily_like_range":          (like_min, like_max),
+            "retweet_probability":       spec.max_retweet_probability,
+            "reply_probability":         spec.max_reply_rate,
+            "follow_rate_per_day":       (follow_min, follow_max),
+            # Content
+            "original_content_ratio":    spec.min_original_content_ratio,
+            # Anti-detection
+            "skip_day_probability":      spec.recommended_skip_day_probability,
+            "weekend_activity_modifier": spec.recommended_weekend_modifier,
+            "burst_avoidance":           True,
+            # Session behavior constraints (from Scribe forensic analysis)
+            "min_session_action_diversity":       spec.min_session_action_diversity,
+            "min_avg_dwell_time_ms":              spec.min_avg_dwell_time_ms,
+            "min_session_duration_variance_pct":  spec.min_session_duration_variance_pct,
+            "min_scroll_impression_ratio":        spec.min_scroll_impression_ratio,
+            "min_impression_action_ratio":        spec.min_impression_action_ratio,
+            "max_follow_velocity_per_day":        spec.max_follow_velocity_per_day,
+            "max_rate_limit_events_per_day":      spec.max_rate_limit_events_per_day,
+            "max_error_rate":                     spec.max_error_rate,
+            "min_ad_impression_ratio":            spec.min_ad_impression_ratio,
+            # Scribe session rules (hard constraints from Twitter forensic analysis)
+            # These override model-derived specs — violating ANY triggers botmaker
+            "_scribe_session_rules":     SCRIBE_SESSION_RULES,
+            # Metadata
+            "_spec_version":             spec.model_version,
+            "_generated_at":             spec.generated_at,
+        }
+
+    # ------------------------------------------------------------------
+    # Public: Redis persistence
+    # ------------------------------------------------------------------
+
+    async def store_spec(
+        self, redis_client: aioredis.Redis, spec: SleeperSpec
+    ) -> None:
+        """Store spec as latest and append to sorted history."""
+        payload = json.dumps(spec.to_dict())
+
+        # Latest (simple key)
+        await redis_client.set(_SPEC_LATEST_KEY, payload)
+
+        # History (sorted set, score = timestamp)
+        await redis_client.zadd(
+            _SPEC_HISTORY_KEY,
+            {payload: spec.generated_at},
+        )
+        # Keep last 50 specs in history
+        await redis_client.zremrangebyrank(_SPEC_HISTORY_KEY, 0, -51)
+
+        logger.info(
+            "SleeperSpec stored at %s (ts=%.0f)",
+            _SPEC_LATEST_KEY, spec.generated_at,
+        )
+
+    @staticmethod
+    async def get_latest_spec(
+        redis_client: aioredis.Redis,
+    ) -> Optional[SleeperSpec]:
+        """Retrieve the most recent SleeperSpec from Redis."""
+        raw = await redis_client.get(_SPEC_LATEST_KEY)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            return SleeperSpec.from_dict(data)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            logger.error("Failed to deserialize SleeperSpec: %s", exc)
+            return None
+
+
+def build_default_spec(
+    model_version: str = "pretrained_baseline",
+    dataset_size: int = 0,
+) -> SleeperSpec:
+    """
+    Return a conservative SleeperSpec using safe defaults.
+    Used when no training data is available yet.
+    """
+    d = _SAFE_DEFAULTS
+    zero_importances = {
+        "burst_ratio": 0.0, "hour_entropy": 0.0, "weekend_ratio": 0.0,
+        "retweet_ratio": 0.0, "url_ratio": 0.0, "hashtag_density": 0.0,
+        "mention_density": 0.0, "follower_count": 0.0, "account_age_days": 0.0,
+        # Pre-seed with Twitter's known high-weight signals (from forensic analysis)
+        # These ensure even the default spec respects Scribe detection priorities
+        "dwell_time": 0.0, "session_diversity": 0.0, "action_type_entropy": 0.0,
+        # Scribe-aware session / social graph / red flag features
+        "session_action_diversity": 0.0, "avg_dwell_time_ms": 0.0,
+        "session_duration_cv": 0.0, "impression_action_ratio": 0.0,
+        "avg_actions_per_session": 0.0, "scroll_impression_ratio": 0.0,
+        "follow_velocity_per_day": 0.0, "unfollow_ratio": 0.0,
+        "reply_thread_depth_avg": 0.0, "follow_back_ratio": 0.0,
+        "rate_limit_events_per_day": 0.0, "error_rate": 0.0,
+        "ad_impression_ratio": 0.0,
+    }
+    return SleeperSpec(
+        max_tweets_per_hour                  = d["max_tweets_per_hour"],
+        min_gap_between_tweets_seconds       = d["min_gap_between_tweets_seconds"],
+        max_burst_count_per_day              = d["max_burst_count_per_day"],
+        required_sleep_hours                 = d["required_sleep_hours"],
+        max_url_ratio                        = d["max_url_ratio"],
+        max_hashtag_density                  = d["max_hashtag_density"],
+        max_mention_density                  = d["max_mention_density"],
+        min_original_content_ratio           = d["min_original_content_ratio"],
+        min_account_age_before_campaign_hours = d["min_account_age_before_campaign_hours"],
+        required_follow_real_humans          = d["required_follow_real_humans"],
+        max_swarm_follow_ratio               = d["max_swarm_follow_ratio"],
+        max_retweet_probability              = d["max_retweet_probability"],
+        max_reply_rate                       = d["max_reply_rate"],
+        recommended_weekend_modifier         = d["recommended_weekend_modifier"],
+        recommended_skip_day_probability     = d["recommended_skip_day_probability"],
+        recommended_engagement_pattern       = d["recommended_engagement_pattern"],
+        max_follow_velocity_per_day          = d["max_follow_velocity_per_day"],
+        min_session_action_diversity         = d["min_session_action_diversity"],
+        min_avg_dwell_time_ms                = d["min_avg_dwell_time_ms"],
+        min_session_duration_variance_pct    = d["min_session_duration_variance_pct"],
+        min_scroll_impression_ratio          = d["min_scroll_impression_ratio"],
+        min_impression_action_ratio          = d["min_impression_action_ratio"],
+        max_rate_limit_events_per_day        = d["max_rate_limit_events_per_day"],
+        max_error_rate                       = d["max_error_rate"],
+        min_ad_impression_ratio              = d["min_ad_impression_ratio"],
+        feature_importances                  = zero_importances,
+        generated_at                         = time.time(),
+        model_version                        = model_version,
+        dataset_size                         = dataset_size,
+        model_accuracy                       = 0.0,
+    )

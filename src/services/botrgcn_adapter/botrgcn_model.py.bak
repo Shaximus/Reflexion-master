@@ -1,0 +1,2678 @@
+#!/usr/bin/env python3
+"""
+train_botrgcn_parallel_progress.py - PRODUCTION-QUALITY TEMPORAL FEATURES
+--------------------------------------------------------------------------
+🔥 CHATGPT-VALIDATED ROBUST TEMPORAL + CONTENT + ENGAGEMENT EXTRACTION 🔥
+
+NEW IN THIS VERSION (Oct 3, 2025 - ChatGPT Quality Control Applied):
+  ✅ 16 ROBUST TEMPORAL FEATURES (15 normalized + 1 has_tweets bit)
+  ✅ Multi-modal 5-way fusion: Des + Tweet + Profile + Graph + TEMPORAL
+  ✅ Research-backed features with PRODUCTION ROBUSTNESS FIXES
+
+ROBUSTNESS IMPROVEMENTS (ChatGPT feedback):
+  ✅ Trimmed statistics (drop top/bottom 5% outliers for gap analysis)
+  ✅ Log1p transforms for heavy-tailed engagement (prevents training instability)
+  ✅ Smoothed ratios with Laplace smoothing (no 0/0 divisions)
+  ✅ Z-score normalization from TRAIN split only (prevents leakage)
+  ✅ has_tweets bit to distinguish zero-tweet users from low-activity
+  ✅ Gaps in MINUTES not seconds (more stable scale)
+
+TEMPORAL FEATURES (16-dim vector):
+  1. TEMPORAL PATTERNS (6 features):
+     - Median inter-tweet gap (trimmed, minutes) - bots regular, humans vary
+     - Std dev of gaps (trimmed) - bots low variance
+     - Coefficient of variation (CV = std/mean)
+     - Burst ratio (% gaps ≤1min, Laplace smoothed) - bots burst spam
+     - Hour entropy (UTC-based) - bots 24/7, humans sleep
+     - Weekend ratio (smoothed) - bots ignore weekends
+
+  2. CONTENT PATTERNS (4 features - all Laplace smoothed):
+     - Retweet ratio (bots amplify propaganda)
+     - URL ratio (bots spam links)
+     - Hashtag density (bots farm visibility)
+     - Mention density (bots coordinate attacks)
+
+  3. ENGAGEMENT PATTERNS (5 features - all log1p transformed):
+     - log1p(avg_retweets) - bots get low engagement
+     - log1p(avg_replies)
+     - log1p(avg_likes)
+     - log1p(engagement_std) - bots uniformly ignored
+     - Engagement CV (variance/mean)
+
+  4. HAS_TWEETS BIT (1 feature):
+     - Binary mask: 1 = has tweets, 0 = no tweets
+
+ARCHITECTURE IMPROVEMENTS:
+  ✅ TemporalMLP: 16 → 64 (GELU + BatchNorm + Dropout) → 128
+  ✅ All branches output 128-dim (consistent scale)
+  ✅ Fusion: 5×128 → LayerNorm(640) → Linear(128) ← STABLE
+  ✅ Focal Loss option (alpha=0.75, gamma=2.0) for hard example focus
+  ✅ Feature standardization saved to temporal_norm_v1.json
+
+EXPECTED PERFORMANCE BOOST:
+  - Baseline (profile + embeddings + graph): 60% Bot F1
+  - With robust temporal features: 65-70% Bot F1 (ChatGPT validated)
+  - With Focal Loss (if needed): +1-3% Bot F1 on hard cases
+
+Original features preserved:
+  • Real-time progress bars (tqdm) across long-running steps
+  • Safer memory usage (CPU RAM cap awareness; per-batch GPU transfers)
+  • Speed-ups (vectorized edge build, batched text embedding, AMP training)
+  • Robustness fixes (mask handling, device issues, graceful cache resume)
+
+Cache files:
+  - CACHE_DIR / 'des_embeddings.npy'
+  - CACHE_DIR / 'tweet_embeddings.npy'
+  - CACHE_DIR / 'num_props.npy'
+  - CACHE_DIR / 'cat_props.npy'
+  - CACHE_DIR / 'temporal_features.npy'  ← NEW (z-score normalized)
+  - CACHE_DIR / 'temporal_norm_v1.json' ← NEW (mean/std params)
+  - CACHE_DIR / 'botrgcn_best.pt'
+
+Usage
+-----
+    python train_botrgcn_parallel_progress.py
+
+Environment overrides (optional):
+    RAM_LIMIT_GB=60                # Default for 64GB system
+    NUM_WORKERS=1                  # GPU workers (CPU workers auto-scale)
+    BATCH_SIZE=256                 # INCREASED: was 128, now 256 for better GPU util
+    LR=0.01
+    EPOCHS=200
+    PATIENCE=20
+    USE_FOCAL_LOSS=1              # Enable Focal Loss for hard examples
+
+RAM Optimizations Applied (Oct 2025):
+    ✅ Contiguous tensor preloading (eliminates per-batch numpy→torch conversion)
+    ✅ Persistent DataLoader workers (reuse workers, no spawn/join overhead)
+    ✅ Prefetch factor=4 (keep GPU fed while CPU prepares batches)
+    ✅ Thread throttling (OMP/MKL capped at 4 threads to reduce CPU storms)
+    ✅ Fixed-width progress bars (less terminal repaint overhead)
+    ✅ Increased batch size to 256 (better GPU saturation)
+
+To force temporal re-extraction (ONLY delete these):
+    rm botrgcn_cache/temporal_*.npy
+    rm botrgcn_cache/temporal_norm_*.json
+
+Notes
+-----
+- Requires: torch, torch-geometric, transformers, pandas, numpy, sklearn, tqdm, scipy
+- Optional: psutil (for RAM guard), ijson (streaming JSON)
+- DO NOT delete all caches - only temporal_* files to rebuild features
+"""
+
+import argparse
+import gc
+import json
+import logging
+import math
+import multiprocessing as mp
+import os
+from datetime import datetime
+from pathlib import Path
+
+# Fix deprecated HuggingFace cache environment variable
+os.environ['HF_HOME'] = os.environ.get('TRANSFORMERS_CACHE', os.path.expanduser('~/.cache/huggingface'))
+
+# Force PyG to use native Python sampling (avoids CUDA version mismatch)
+os.environ['TORCH_USE_RTLD_GLOBAL'] = '1'
+
+from typing import Dict, List, Tuple, Optional, Set, Iterable
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.metrics import classification_report, f1_score, average_precision_score, precision_recall_curve
+from sklearn.preprocessing import StandardScaler
+from torch_geometric.data import Data
+from torch_geometric.loader import NeighborLoader
+from torch_geometric.nn import RGCNConv
+from tqdm import tqdm
+from transformers import AutoModel, AutoTokenizer
+import random
+
+# LMDB integration for fast tweet loading
+from lmdb_integration import load_tweets_lmdb
+
+# --- Logger setup ---
+logger = logging.getLogger("botrgcn")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# --- DETERMINISM & REPRODUCIBILITY (ChatGPT Oct 6 Recommendation) ---
+def set_global_seed(seed: int = 42):
+    """Set global seed for reproducible runs (ablations, threshold tuning, etc.)"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Determinism/throughput trade-off: enable for lab, disable for prod
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    logger.info(f"Global seed set to {seed} (deterministic mode enabled)")
+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+# ---- RAM OPTIMIZATION: Throttle CPU thread storms ----
+# Prevents MKL/OpenMP from hammering all cores during tensor ops
+# ChatGPT Oct 6: Make env-friendly with overrides
+torch.set_num_threads(int(os.getenv("TORCH_NUM_THREADS", "4")))
+os.environ.setdefault("OMP_NUM_THREADS", os.getenv("OMP_NUM_THREADS", "4"))
+os.environ.setdefault("MKL_NUM_THREADS", os.getenv("MKL_NUM_THREADS", "4"))
+
+# Toggle with env var: USE_GPU_EMB=1 (default on if CUDA available)
+USE_GPU_EMB = os.getenv("USE_GPU_EMB", "1") == "1"
+USE_TEMPORAL_V2 = os.getenv("USE_TEMPORAL_V2", "0") == "1"  # Set USE_TEMPORAL_V2=1 for 32-dim features
+EMB_DEVICE = "cuda" if (USE_GPU_EMB and torch.cuda.is_available()) else "cpu"
+
+# Helpful defaults for GPU mode
+if EMB_DEVICE == "cuda":
+    # Bigger batches on GPU; keep within VRAM comfort zone
+    HF_BATCH = int(os.getenv("HF_BATCH", "128"))  # was 16
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+else:
+    HF_BATCH = int(os.getenv("HF_BATCH", "16"))
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Optional deps
+try:
+    import psutil
+except Exception:  # pragma: no cover
+    psutil = None
+
+# -----------------------
+# Configuration / Paths
+# -----------------------
+DATA_DIR = Path(
+    os.getenv(
+        "DATA_DIR", "/mnt/windows_f/twitbot-22/extracted/TwiBot-22"
+    )
+)
+GRAPH_FILE = Path(
+    os.getenv("GRAPH_FILE", "/mnt/windows_f/twitbot-22/edge-001.csv")
+)
+TWEET_FEATURES = Path(
+    os.getenv(
+        "TWEET_FEATURES",
+        "/mnt/windows_f/Reflexion_ultimate/vigilante/hunter/tweet_features_REAL_20251002_105459.csv",
+    )
+)
+TWEET_DIR = Path(os.getenv("TWEET_DIR", "/mnt/windows_f/twitbot-22"))
+TWEET_FILES = sorted(TWEET_DIR.glob("tweet*.json"))
+LMDB_PATH = Path(os.getenv("LMDB_PATH", "/home/the-architect/Reflexion_ultimate/vigilante/tweets.lmdb"))
+CACHE_DIR = Path(
+    os.getenv("CACHE_DIR", "/home/the-architect/Reflexion_ultimate/vigilante/hunter/botrgcn_cache")
+)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---- Permanent GPU-friendly defaults (overridable by env) ----
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", "1"))  # 1 for GPU embeddings (CPU workers handled by decide_pool_workers)
+HF_BATCH = int(os.getenv("HF_BATCH", "96"))  # try 96→128 if VRAM allows
+HF_MAX_LEN = int(os.getenv("HF_MAX_LEN", "356"))  # your chosen length
+EMBED_DIM = int(os.getenv("EMBED_DIM", "128"))
+DROPOUT = float(os.getenv("DROPOUT", "0.3"))
+LR = float(os.getenv("LR", "0.01"))
+WEIGHT_DECAY = float(os.getenv("WEIGHT_DECAY", "0.05"))
+EPOCHS = int(os.getenv("EPOCHS", "200"))  # Full training
+PATIENCE = int(os.getenv("PATIENCE", "25"))  # Early stopping patience
+NUM_RELATIONS = int(os.getenv("NUM_RELATIONS", "2"))
+USE_FOCAL_LOSS = os.getenv("USE_FOCAL_LOSS", "0") == "1"  # Set USE_FOCAL_LOSS=1 to enable
+SUBSET_SIZE = os.getenv("SUBSET_SIZE")
+SUBSET_SIZE = int(SUBSET_SIZE) if SUBSET_SIZE not in (None, "", "None") else None
+MAX_TWEETS_PER_USER = int(os.getenv("MAX_TWEETS_PER_USER", "999999"))  # Curtis Oct 6: UNLIMITED - sequential loading prevents RAM spike
+RAM_LIMIT_GB = float(os.getenv("RAM_LIMIT_GB", "60"))  # Updated for 64GB system (was 50 for 32GB)
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "256"))  # RAM optimization: increased from 128
+TEMP_GAIN_INIT = float(os.getenv("TEMP_GAIN_INIT", "1.0"))  # NEW: force temporal branch magnitude
+DISABLE_FUSION_GATE = os.getenv("DISABLE_FUSION_GATE", "0") == "1"  # NEW: bypass gate for testing
+USE_DISK_CACHE = os.getenv("USE_DISK_CACHE", "0") == "1"  # Set USE_DISK_CACHE=1 to use disk-backed shelve
+
+# Embedding model & device
+HF_MODEL_NAME = os.getenv("HF_MODEL_NAME", "distilroberta-base")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Neighbor sampling / loader
+NEIGH_NUM = list(
+    map(int, os.getenv("NEIGH_NUM", "20,20").split(","))
+)  # lighter than 30,30
+LOADER_WORKERS = int(os.getenv("LOADER_WORKERS", "0"))  # 0 to avoid torch-sparse import issues in workers
+PIN_MEMORY = os.getenv("PIN_MEMORY", "1") == "1"
+
+
+# -----------------------
+# Helpers / Utilities
+# -----------------------
+def human_bytes(num: float) -> str:
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(num) < 1024.0:
+            return f"{num:3.1f}{unit}"
+        num /= 1024.0
+    return f"{num:.1f}PB"
+
+
+def check_ram_guard(stage: str) -> None:
+    """Log RAM usage and warn if approaching limit. Does not kill the run."""
+    if psutil is None:
+        return
+    mem = psutil.virtual_memory()
+    used_gb = (mem.total - mem.available) / (1024**3)
+    avail_gb = mem.available / (1024**3)
+    logger.info(
+        f"[RAM] {stage}: used={used_gb:.1f} GB | free={avail_gb:.1f} GB | limit={RAM_LIMIT_GB:.1f} GB"
+    )
+    if used_gb > RAM_LIMIT_GB * 0.95:
+        logger.warning(
+            f"[RAM] Approaching or exceeding requested limit ({RAM_LIMIT_GB} GB). Consider reducing NUM_WORKERS or BATCH_SIZE."
+        )
+
+
+def decide_pool_workers(max_workers: int, est_worker_gb: float = 1.2) -> int:
+    """
+    Choose a safe number of workers based on a rough per-worker memory estimate.
+    This doesn't hard-cap memory, but helps stay under the user's 50 GB ceiling.
+    """
+    if psutil is None:
+        return max_workers
+    avail_gb = psutil.virtual_memory().available / (1024**3)
+    # Leave headroom for arrays and overhead
+    budget_gb = max(1.0, min(RAM_LIMIT_GB, avail_gb) * 0.8)
+    safe = int(
+        max(1, min(max_workers, math.floor(budget_gb / max(0.6, est_worker_gb))))
+    )
+    if safe < max_workers:
+        logger.info(
+            f"Reducing pool from {max_workers} -> {safe} workers based on RAM guard"
+        )
+    return safe
+
+
+def compact_tweet_text(tweets, max_n=MAX_TWEETS_PER_USER) -> str:
+    """
+    Build a single text string for HF embeddings from a tweet list.
+    Curtis Oct 6: Use ALL tweets (max_n is now effectively unlimited = 999999)
+    - If list of dicts: join all texts
+    - If list of strings: join all
+    - If already a string: return as-is
+    """
+    if isinstance(tweets, list):
+        if not tweets:
+            return ""
+        if isinstance(tweets[0], dict):
+            return " ".join([t.get("text", "") for t in tweets])  # Curtis Oct 6: Removed [-max_n:] limit
+        return " ".join(tweets)  # Curtis Oct 6: Removed [-max_n:] limit
+    if isinstance(tweets, str):
+        return tweets
+    return ""
+
+
+# normalize_tweet_chunks removed - no longer needed with structured tweet handling
+
+
+# -----------------------
+# Data Loading
+# -----------------------
+def load_labels() -> pd.DataFrame:
+    """Load label.csv (maps 'human'->0, 'bot'->1)."""
+    labels_df = pd.read_csv(DATA_DIR / "label.csv")
+    labels_df["id"] = labels_df["id"].astype(str).str.lstrip("u")
+    labels_df["label"] = labels_df["label"].map({"human": 0, "bot": 1})
+    return labels_df
+
+
+def load_splits() -> pd.DataFrame:
+    """Load split.csv; normalize split names ('val','validate','validation')."""
+    splits_df = pd.read_csv(DATA_DIR / "split.csv")
+    splits_df["id"] = splits_df["id"].astype(str).str.lstrip("u")
+    splits_df["split"] = (
+        splits_df["split"]
+        .astype(str)
+        .str.lower()
+        .map(
+            {
+                "train": "train",
+                "val": "val",
+                "valid": "val",
+                "validate": "val",
+                "validation": "val",
+                "test": "test",
+            }
+        )
+        .fillna("train")
+    )
+    return splits_df
+
+
+def load_users_chunked(
+    allowed_ids: Optional[Set[str]] = None, log_every: int = 100_000
+) -> List[Dict]:
+    """Stream user.json and optionally filter to allowed IDs to keep memory bounded."""
+    logger.info("Streaming user.json (processed in chunks to limit RAM)...")
+    users: List[Dict] = []
+    collected = 0
+    allowed_ids_norm = (
+        {str(uid) for uid in allowed_ids} if allowed_ids is not None else None
+    )
+
+    try:
+        import ijson  # type: ignore
+
+        with open(DATA_DIR / "user.json", "rb") as f:
+            parser = ijson.items(f, "item")
+            for user in parser:
+                user_id = str(user.get("id", "")).lstrip("u")
+                if allowed_ids_norm is not None and user_id not in allowed_ids_norm:
+                    continue
+                user["id"] = user_id
+                users.append(user)
+                collected += 1
+                if collected % log_every == 0:
+                    logger.info(f"Collected {collected:,} users so far")
+                if SUBSET_SIZE and collected >= SUBSET_SIZE:
+                    break
+    except Exception:
+        logger.warning(
+            "ijson not installed or failed; falling back to json.load (higher memory usage)"
+        )
+        with open(DATA_DIR / "user.json", "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        for user in tqdm(raw, desc="Users", unit="u"):
+            user_id = str(user.get("id", "")).lstrip("u")
+            if allowed_ids_norm is not None and user_id not in allowed_ids_norm:
+                continue
+            user["id"] = user_id
+            users.append(user)
+            if SUBSET_SIZE and len(users) >= SUBSET_SIZE:
+                break
+
+    logger.info(f"Loaded {len(users):,} users into memory")
+    check_ram_guard("After loading users")
+    return users
+
+
+def _batched(iterable: List, batch_size: int) -> Iterable[List]:
+    """Yield lists of size batch_size."""
+    for i in range(0, len(iterable), batch_size):
+        yield iterable[i : i + batch_size]
+
+
+def extract_des_embeddings_worker(args):
+    """
+    Worker: DistilRoBERTa embeddings for profile descriptions (batched).
+    - Uses GPU with AMP if available (env USE_GPU_EMB=1, default on)
+    - Stable tqdm (each worker pinned to its own line)
+    - Robust to empty/None texts (zeros preserved for compatibility)
+    """
+    import os
+    import numpy as np
+    import torch
+    from tqdm import tqdm
+    from transformers import AutoModel, AutoTokenizer
+
+    descriptions_chunk, worker_id, batch_size = args
+
+    # Hygiene: stop tokenizer/BLAS thread fights in multiprocessing
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    try:
+        torch.set_num_threads(1)
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+    except Exception:
+        pass
+
+    # Device & AMP
+    device = (
+        "cuda"
+        if (os.getenv("USE_GPU_EMB", "1") == "1" and torch.cuda.is_available())
+        else "cpu"
+    )
+    use_amp = device == "cuda"
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+    print(
+        f"[Worker {worker_id}] Loading {HF_MODEL_NAME} for descriptions on {device}..."
+    )
+    tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME)
+    model = (
+        AutoModel.from_pretrained(
+            HF_MODEL_NAME,
+            torch_dtype=(torch.float16 if torch.cuda.is_available() else torch.float32),
+        )
+        .to(device)
+        .eval()
+    )
+
+    total = len(descriptions_chunk)
+    embeddings = []
+
+    with tqdm(
+        total=total,
+        desc=f"des[{worker_id}]",
+        leave=False,
+        position=worker_id + 1,
+        dynamic_ncols=True,
+        mininterval=0.5,
+    ) as pbar:
+
+        for batch in _batched(descriptions_chunk, batch_size):
+            texts = [(t if (t and t != "None") else "") for t in batch]
+
+            if not any(texts):
+                embeddings.extend([np.zeros(768, dtype=np.float32) for _ in texts])
+                pbar.update(len(texts))
+                continue
+
+            try:
+                inputs = tokenizer(
+                    texts,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=HF_MAX_LEN,
+                    padding=True,
+                )
+                inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+
+                with (
+                    torch.no_grad(),
+                    torch.autocast("cuda", enabled=use_amp, dtype=torch.float16),
+                ):
+
+                    hidden = model(**inputs).last_hidden_state  # [B,L,768]
+                    vecs = hidden.mean(dim=1).detach().to("cpu").numpy()
+
+                for text, vec in zip(texts, vecs):
+                    if text == "":
+                        embeddings.append(np.zeros(768, dtype=np.float32))
+                    else:
+                        embeddings.append(vec.astype(np.float32, copy=False))
+
+            except RuntimeError as e:
+                # Fallback to CPU if OOM on GPU
+                if "out of memory" in str(e).lower() and device == "cuda":
+                    torch.cuda.empty_cache()
+                    inputs = {k: v.to("cpu") for k, v in inputs.items()}
+                    with torch.no_grad():
+                        hidden = model.to("cpu")(**inputs).last_hidden_state
+                        vecs = hidden.mean(dim=1).detach().numpy()
+                    model.to("cuda")
+                    for text, vec in zip(texts, vecs):
+                        embeddings.append(
+                            np.zeros(768, dtype=np.float32)
+                            if text == ""
+                            else vec.astype(np.float32, copy=False)
+                        )
+                else:
+                    embeddings.extend([np.zeros(768, dtype=np.float32) for _ in texts])
+
+            pbar.update(len(texts))
+
+    return np.asarray(embeddings, dtype=np.float32)
+
+
+def extract_tweet_embeddings_worker(args):
+    """
+    Worker: DistilRoBERTa embeddings for tweet histories (batched).
+    - Uses GPU + AMP if available
+    - Stable tqdm positions so bars don’t clash
+    - Safely handles empty histories
+    """
+    import os
+    import numpy as np
+    import torch
+    from tqdm import tqdm
+    from transformers import AutoTokenizer, AutoModel
+
+    tweets_chunk, worker_id, batch_size = args
+
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    try:
+        torch.set_num_threads(1)
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+    except Exception:
+        pass
+
+    device = (
+        "cuda"
+        if (os.getenv("USE_GPU_EMB", "1") == "1" and torch.cuda.is_available())
+        else "cpu"
+    )
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+    use_amp = device == "cuda"
+
+    print(f"[Worker {worker_id}] Loading {HF_MODEL_NAME} for tweets on {device}...")
+    tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME)
+    model = (
+        AutoModel.from_pretrained(
+            HF_MODEL_NAME,
+            torch_dtype=(torch.float16 if device == "cuda" else torch.float32),
+        )
+        .to(device)
+        .eval()
+    )
+
+    total = len(tweets_chunk)
+    embeddings: list[np.ndarray] = []
+
+    with tqdm(
+        total=total,
+        desc=f"tw[{worker_id}]",
+        leave=False,
+        position=worker_id + 1,
+        dynamic_ncols=True,
+        mininterval=0.5,
+    ) as pbar:
+
+        for batch in _batched(tweets_chunk, batch_size):
+            # Compose the text history
+            texts = [compact_tweet_text(t) for t in batch]
+            texts = [(t if (t and t != "None") else "") for t in texts]
+
+            if not any(texts):
+                # all empty → zeros
+                embeddings.extend([np.zeros(768, dtype=np.float32) for _ in texts])
+                pbar.update(len(texts))
+                continue
+
+            try:
+                inputs = tokenizer(
+                    texts,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=HF_MAX_LEN,
+                    padding=True,
+                )
+                inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+
+                with (
+                    torch.no_grad(),
+                    torch.autocast("cuda", enabled=use_amp, dtype=torch.float16),
+                ):
+                    hidden = model(**inputs).last_hidden_state
+                    vecs = hidden.mean(dim=1).detach().to("cpu").numpy()
+
+                for txt, vec in zip(texts, vecs):
+                    if txt == "":
+                        embeddings.append(np.zeros(768, dtype=np.float32))
+                    else:
+                        embeddings.append(vec.astype(np.float32, copy=False))
+
+            except RuntimeError as e:
+                # OOM fallback: move to CPU and compute more safely
+                if "out of memory" in str(e).lower() and device == "cuda":
+                    torch.cuda.empty_cache()
+                    cpu_inputs = {k: v.cpu() for k, v in inputs.items()}
+                    with torch.no_grad():
+                        hidden = model.to("cpu")(**cpu_inputs).last_hidden_state
+                        vecs = hidden.mean(dim=1).detach().numpy()
+                    model.to(device)
+                    for txt, vec in zip(texts, vecs):
+                        embeddings.append(
+                            np.zeros(768, dtype=np.float32)
+                            if txt == ""
+                            else vec.astype(np.float32, copy=False)
+                        )
+                else:
+                    # On any error, fallback to zeros
+                    embeddings.extend([np.zeros(768, dtype=np.float32) for _ in texts])
+
+            pbar.update(len(texts))
+
+    return np.asarray(embeddings, dtype=np.float32)
+
+
+def _pool_initializer():
+    try:
+        import os, torch
+
+        torch.set_num_threads(1)
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    except Exception:
+        pass
+
+
+def parallel_extract_embeddings(
+    chunks: List, func, num_workers: int, batch_size: int
+) -> np.ndarray:
+    """Run HF embedding workers; when num_workers==1, avoid Pool (faster, cleaner)."""
+    logger.info(
+        f"Starting {num_workers} worker(s) for embedding extraction (batch={batch_size})..."
+    )
+    if num_workers <= 1:
+        # Single worker fast-path (also avoids the confusing global progress bar)
+        return func((chunks[0], 0, batch_size))
+
+    results = []
+    worker_args = [(chunk, i, batch_size) for i, chunk in enumerate(chunks)]
+    with mp.Pool(
+        processes=num_workers, initializer=_pool_initializer, maxtasksperchild=1
+    ) as pool:
+        for res in tqdm(
+            pool.imap_unordered(func, worker_args),
+            total=len(worker_args),
+            desc="Embedding workers",
+        ):
+            results.append(res)
+    stacked = np.vstack(results) if results else np.empty((0, 768), dtype=np.float32)
+    check_ram_guard("After embedding extraction")
+    return stacked
+
+
+def load_tweets_from_file(args):
+    """
+    Worker function to load tweets from a single file using ijson streaming.
+
+    NOW EXTRACTS COMPREHENSIVE DATA:
+    - text: Tweet content
+    - created_at: Timestamp for temporal analysis
+    - retweet_count, reply_count, like_count: Engagement metrics
+    - source: Device/client info (bot detection signal)
+    - entities: hashtags, urls, mentions for content analysis
+    """
+    tweet_file, user_ids_set = args
+    local_tweets: Dict[str, List[Dict]] = {}
+    print(f"[TWEET WORKER] {tweet_file.name} ...")
+    try:
+        import ijson  # type: ignore
+        from datetime import datetime
+
+        with open(tweet_file, "r", encoding="utf-8") as f:
+            parser = ijson.items(f, "item")
+            count = 0
+            matched = 0
+            for tweet in parser:
+                count += 1
+                if count % 500_000 == 0:
+                    print(
+                        f"[{tweet_file.name}] {count:,} tweets scanned; matched {matched:,}"
+                    )
+                author_id = str(tweet.get("author_id", ""))
+                if author_id.startswith("u"):
+                    author_id = author_id[1:]
+
+                if author_id in user_ids_set:
+                    # Extract comprehensive tweet data
+                    public_metrics = tweet.get("public_metrics") or {}
+                    entities = tweet.get("entities") or {}
+                    tweet_data = {
+                        "text": tweet.get("text", ""),
+                        "created_at": tweet.get("created_at", ""),
+                        "retweet_count": public_metrics.get("retweet_count", 0),
+                        "reply_count": public_metrics.get("reply_count", 0),
+                        "like_count": public_metrics.get("like_count", 0),
+                        "quote_count": public_metrics.get("quote_count", 0),
+                        "source": tweet.get("source", ""),
+                        "is_retweet": "retweeted_status" in tweet or tweet.get("text", "").startswith("RT @"),
+                        "hashtags": len(entities.get("hashtags", [])),
+                        "urls": len(entities.get("urls", [])),
+                        "mentions": len(entities.get("mentions", [])),
+                    }
+
+                    bucket = local_tweets.setdefault(author_id, [])
+                    bucket.append(tweet_data)
+                    if len(bucket) > MAX_TWEETS_PER_USER:
+                        del bucket[:-MAX_TWEETS_PER_USER]
+                    matched += 1
+    except Exception as e:
+        import traceback
+
+        logger.error(f"Error loading {tweet_file}: {e}\n{traceback.format_exc()}")
+    return local_tweets
+
+
+def load_tweets(
+    user_id_to_tweets: Dict[str, List], num_workers: int
+) -> Dict[str, List]:
+    """
+    Stream tweet.json* files in parallel, map to users.
+    Curtis Oct 6: If USE_DISK_CACHE=1, stores tweets in disk-backed shelve (NVMe speed, zero RAM)
+    """
+    if not TWEET_FILES:
+        logger.warning("No tweet files found - using empty tweets for all users")
+        return user_id_to_tweets
+
+    # Curtis Oct 6: Sequential file loading (RAM-based but no parallel spike)
+    user_ids_set = set(user_id_to_tweets.keys())
+
+    logger.info(f"📥 Loading tweets sequentially (one file at a time, RAM-safe)...")
+
+    for tweet_file in tqdm(TWEET_FILES, desc="Tweet files (sequential)"):
+        # Load just THIS file
+        local_tweets = load_tweets_from_file((tweet_file, user_ids_set))
+
+        # Merge into main dict
+        for uid, tweets in local_tweets.items():
+            if uid not in user_id_to_tweets:
+                continue
+            bucket = user_id_to_tweets[uid]
+            bucket.extend(tweets)
+            if len(bucket) > MAX_TWEETS_PER_USER:
+                del bucket[:-MAX_TWEETS_PER_USER]
+
+        # Clear this file's data
+        del local_tweets
+        gc.collect()
+
+        # Log progress
+        check_ram_guard(f"After {tweet_file.name}")
+
+    logger.info(f"Total users with tweets: {sum(1 for v in user_id_to_tweets.values() if v)}")
+    check_ram_guard("After loading all tweets")
+    return user_id_to_tweets
+
+
+def extract_temporal_features(tweets_data: List[Dict]) -> Tuple[np.ndarray, int]:
+    """
+    Extract ROBUST temporal and content features from tweets.
+
+    ROBUSTNESS IMPROVEMENTS (ChatGPT feedback):
+    - Trimmed statistics (drop outliers) for gap analysis
+    - Log1p transforms for heavy-tailed engagement metrics
+    - Smoothed ratios (Laplace smoothing) to avoid 0/0
+    - has_tweets bit to distinguish zero-tweet users from low-activity
+    - All gaps computed in MINUTES (not seconds) for stability
+
+    Returns: (features: 16-dim vector, has_tweets: 0 or 1)
+    """
+    from datetime import datetime
+    import scipy.stats
+
+    # -- START MODIFICATION (Curtis Oct 6: Timestamp Autopsy) --
+    # Add counters for our audit
+    global total_timestamps_processed, total_timestamps_failed
+    # -- END MODIFICATION --
+
+    # has_tweets bit (separate from zeros vector)
+    if not tweets_data or len(tweets_data) == 0:
+        return np.zeros(16, dtype=np.float32), 0
+
+    # Parse timestamps (support multiple formats)
+    DEBUG_TS = False  # Set True to see timestamp samples
+    def _parse_created_at(s):
+        # TwiBot-22 uses: "2022-02-27 04:59:35+00:00"
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S%z",           # TwiBot-22 format (CORRECT!)
+            "%a %b %d %H:%M:%S %z %Y",       # Twitter v1.1 RFC
+            "%Y-%m-%dT%H:%M:%S%z",           # ISO-8601 without microseconds
+            "%Y-%m-%dT%H:%M:%S.%f%z"         # ISO-8601 with microseconds
+        ):
+            try:
+                return datetime.strptime(s.replace("Z", "+0000"), fmt)
+            except:
+                pass
+        return None
+
+    timestamps = []
+    failed_samples = []
+    for tweet in tweets_data:
+        try:
+            ts_str = tweet.get("created_at", "")
+            # -- START MODIFICATION (Curtis Oct 6: Timestamp Autopsy) --
+            total_timestamps_processed += 1
+            # -- END MODIFICATION --
+            if ts_str:
+                ts = _parse_created_at(ts_str)
+                if ts:
+                    timestamps.append(ts)
+                else:
+                    # -- START MODIFICATION (Curtis Oct 6: Timestamp Autopsy) --
+                    total_timestamps_failed += 1
+                    if total_timestamps_failed <= 10:  # Log first 10 failed samples globally
+                        logger.warning(f"[TIMESTAMP FAIL] Could not parse: '{ts_str}'")
+                    # -- END MODIFICATION --
+                    if DEBUG_TS and len(failed_samples) < 3:
+                        failed_samples.append(ts_str)
+            else:
+                # -- START MODIFICATION (Curtis Oct 6: Timestamp Autopsy) --
+                total_timestamps_failed += 1
+                # -- END MODIFICATION --
+        except:
+            continue
+
+    if DEBUG_TS and failed_samples:
+        print(f"[TIMESTAMP DEBUG] Failed to parse: {failed_samples[:3]}")
+
+    if len(timestamps) < 2:
+        # Has tweets but not enough for temporal stats
+        return np.zeros(16, dtype=np.float32), 1
+
+    timestamps.sort()
+
+    # ===== TEMPORAL FEATURES (6) =====
+    # Inter-tweet gaps in MINUTES (more stable than seconds)
+    time_diffs_min = [(timestamps[i+1] - timestamps[i]).total_seconds() / 60.0
+                      for i in range(len(timestamps)-1)]
+    time_diffs_min = [t for t in time_diffs_min if t > 0]
+
+    if time_diffs_min and len(time_diffs_min) >= 3:
+        # TRIMMED stats: drop top/bottom 5% to avoid outlier hiatus
+        sorted_diffs = np.sort(time_diffs_min)
+        trim_idx = max(1, int(len(sorted_diffs) * 0.05))
+        trimmed = sorted_diffs[trim_idx:-trim_idx] if len(sorted_diffs) > 2*trim_idx else sorted_diffs
+
+        median_gap = np.median(trimmed)
+        std_gap = np.std(trimmed)
+        mean_gap = np.mean(trimmed)
+        cv_gap = std_gap / (mean_gap + 1e-6)
+
+        # Burst ratio: % gaps <= 1 min (60s) with Laplace smoothing
+        burst_hits = sum(1 for t in time_diffs_min if t <= 1.0)
+        burst_ratio = (burst_hits + 1) / (len(time_diffs_min) + 2)
+    else:
+        median_gap = std_gap = mean_gap = cv_gap = burst_ratio = 0.0
+
+    # Hour entropy (UTC-based, timezone-agnostic rough signal)
+    # ChatGPT Oct 6: Guard for tiny timelines (entropy noisy when tweets < 3)
+    hour_entropy = 0.0
+    if len(timestamps) >= 3:
+        hours = [ts.hour for ts in timestamps]
+        hour_counts = np.bincount(hours, minlength=24)
+        hour_dist = (hour_counts + 1e-9) / (len(hours) + 24*1e-9)  # Smoothed
+        hour_entropy = scipy.stats.entropy(hour_dist)
+
+    # Weekend ratio with smoothing
+    weekend_count = sum(1 for ts in timestamps if ts.weekday() >= 5)
+    weekend_ratio = (weekend_count + 1) / (len(timestamps) + 2)
+
+    # ===== CONTENT FEATURES (4) - SMOOTHED RATIOS =====
+    total_tweets = len(tweets_data)
+
+    retweet_count = sum(1 for t in tweets_data if t.get("is_retweet", False))
+    retweet_ratio = (retweet_count + 1) / (total_tweets + 2)
+
+    url_count = sum(t.get("urls", 0) for t in tweets_data)
+    url_ratio = (url_count + 1) / (total_tweets + 2)
+
+    hashtag_count = sum(t.get("hashtags", 0) for t in tweets_data)
+    hashtag_density = (hashtag_count + 1) / (total_tweets + 2)
+
+    mention_count = sum(t.get("mentions", 0) for t in tweets_data)
+    mention_density = (mention_count + 1) / (total_tweets + 2)
+
+    # ===== ENGAGEMENT FEATURES (5) - LOG1P + CV =====
+    # Handle None values (TwiBot-22 has None for missing metrics)
+    retweets = [t.get("retweet_count") or 0 for t in tweets_data]
+    replies = [t.get("reply_count") or 0 for t in tweets_data]
+    likes = [t.get("like_count") or 0 for t in tweets_data]
+
+    # Log1p transform (heavy-tailed metrics)
+    log_avg_retweets = np.log1p(np.mean(retweets)) if retweets else 0.0
+    log_avg_replies = np.log1p(np.mean(replies)) if replies else 0.0
+    log_avg_likes = np.log1p(np.mean(likes)) if likes else 0.0
+
+    # Engagement variance (log1p std)
+    engagement_scores = [r + rep + lk for r, rep, lk in zip(retweets, replies, likes)]
+    log_engagement_std = np.log1p(np.std(engagement_scores)) if engagement_scores else 0.0
+
+    # Engagement CV (coefficient of variation)
+    mean_eng = np.mean(engagement_scores) if engagement_scores else 0.0
+    std_eng = np.std(engagement_scores) if engagement_scores else 0.0
+    engagement_cv = std_eng / (mean_eng + 1e-6)
+
+    # Assemble feature vector (15 numeric + 1 has_tweets bit = 16)
+    features = np.array([
+        # Temporal (6)
+        median_gap,
+        std_gap,
+        cv_gap,
+        burst_ratio,
+        hour_entropy,
+        weekend_ratio,
+        # Content (4)
+        retweet_ratio,
+        url_ratio,
+        hashtag_density,
+        mention_density,
+        # Engagement (5)
+        log_avg_retweets,
+        log_avg_replies,
+        log_avg_likes,
+        log_engagement_std,
+        engagement_cv,
+        # Mask bit (1 = has tweets)
+        1.0  # has_tweets=1
+    ], dtype=np.float32)
+
+    return features, 1
+
+
+def extract_num_cat_props(users: List[Dict]) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract numeric & categorical features with robust parsing."""
+    num_props = []
+    cat_props = []
+    for user in tqdm(users, desc="Profile props", unit="u"):
+        metrics = user.get("public_metrics", {})
+        if isinstance(metrics, str):
+            try:
+                metrics = json.loads(metrics)
+            except Exception:
+                metrics = {}
+        created_at = user.get("created_at", "Wed Oct 11 12:00:00 +0000 2006")
+        age_days = 0
+        try:
+            # Handle timezone-aware created_at
+            from datetime import datetime as _dt
+
+            age_days = (
+                datetime.now() - _dt.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+            ).days
+        except Exception:
+            pass
+
+        num = [
+            metrics.get("followers_count", 0),
+            metrics.get("following_count", 0),
+            metrics.get("favourites_count", 0),
+            metrics.get("tweet_count", 0),
+            len(user.get("username", "")),
+            age_days,
+        ]
+        cat = [
+            1 if user.get("verified", False) else 0,
+            1 if user.get("protected", False) else 0,
+            1 if bool(user.get("description")) else 0,
+        ]
+        num_props.append(num)
+        cat_props.append(cat)
+
+    scaler = StandardScaler().fit(num_props)
+    num_props = scaler.transform(num_props).astype(np.float32, copy=False)
+    cat_props = np.asarray(cat_props, dtype=np.float32)
+    return num_props, cat_props
+
+
+# -----------------------
+# Graph Construction
+# -----------------------
+def build_graph(edges_path: Path, user_to_idx: Dict[str, int]) -> Data:
+    """
+    Vectorized graph construction with checkpoint/resume + FINAL CACHE.
+
+    Fast path:
+      - If CACHE_DIR/graph_cache.pt exists, load edge_index/edge_type directly and skip CSV parsing.
+
+    Resume path:
+      - Reads edges in 1M-row chunks
+      - Persists per-chunk parts under CACHE_DIR/edge_parts/
+      - Tracks progress in manifest.json (last_done_chunk, counters)
+      - On completion, concatenates parts, saves graph_cache.pt, then (optionally) cleans parts.
+
+    Relations:
+      'following' : source -> target (edge_type = 0)
+      'followers' : reverse  target -> source (edge_type = 1)
+    """
+    import json as _json
+    import pandas as pd
+    import numpy as np
+    from tqdm import tqdm
+
+    logger.info("Loading edges (vectorized, chunked, with resume checkpoints)...")
+
+    # ---------- FINAL CACHE CHECK ----------
+    graph_cache = CACHE_DIR / "graph_cache.pt"
+    if graph_cache.exists():
+        logger.info(
+            f"Found final graph cache: {graph_cache.name} — loading and skipping edge CSV."
+        )
+        ckpt = torch.load(graph_cache, map_location="cpu")
+        edge_index = ckpt["edge_index"]
+        edge_type = ckpt["edge_type"]
+        num_nodes = ckpt["num_nodes"]
+        logger.info(
+            f"Graph cache loaded: {num_nodes:,} nodes, {edge_index.shape[1]:,} edges"
+        )
+        check_ram_guard("After graph cache load")
+        return Data(edge_index=edge_index, edge_type=edge_type, num_nodes=num_nodes)
+    # --------------------------------------
+
+    parts_dir = CACHE_DIR / "edge_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = parts_dir / "manifest.json"
+
+    def _part_paths(i):
+        return (
+            parts_dir / f"edge_src_part_{i}.npy",
+            parts_dir / f"edge_dst_part_{i}.npy",
+            parts_dir / f"edge_type_part_{i}.npy",
+        )
+
+    # Manifest helpers
+    def _load_manifest():
+        if manifest_path.exists():
+            try:
+                return _json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {"last_done_chunk": -1, "rows_seen": 0, "kept_rows": 0, "edges": 0}
+
+    def _save_manifest(m):
+        try:
+            manifest_path.write_text(_json.dumps(m), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Could not write manifest: {e}")
+
+    manifest = _load_manifest()
+    last_done = int(manifest.get("last_done_chunk", -1))
+    rows_seen = int(manifest.get("rows_seen", 0))
+    kept_rows = int(manifest.get("kept_rows", 0))
+    total_edges = int(manifest.get("edges", 0))
+
+    # CSV reader setup
+    read_csv_kwargs = dict(
+        chunksize=1_000_000,
+        usecols=["source_id", "target_id", "relation"],
+        dtype={"source_id": "string", "target_id": "string", "relation": "category"},
+        low_memory=False,
+        # engine="pyarrow",  # uncomment if you have pyarrow for a speed boost
+    )
+
+    user_index = set(user_to_idx.keys())
+
+    # Iterate & resume
+    reader = pd.read_csv(edges_path, **read_csv_kwargs)
+    start_chunk_idx = last_done + 1
+    logger.info(
+        f"[edges] Resuming at chunk index {start_chunk_idx} (last done: {last_done})"
+    )
+
+    for chunk_idx, chunk in enumerate(
+        tqdm(reader, desc="Edge chunks", unit="chunk"), start=0
+    ):
+        if chunk_idx < start_chunk_idx:
+            continue
+
+        src = chunk["source_id"].str.lstrip("u")
+        tgt = chunk["target_id"].str.lstrip("u")
+
+        mask_keep = src.isin(user_index) & tgt.isin(user_index)
+        rows_seen += len(chunk)
+
+        src_list, dst_list, et_list = [], [], []
+
+        if mask_keep.any():
+            sub = chunk.loc[mask_keep]
+            sub_src = src[mask_keep].to_numpy()
+            sub_tgt = tgt[mask_keep].to_numpy()
+            rel = sub["relation"]
+
+            # following: source -> target
+            m_following = rel == "following"
+            if m_following.any():
+                s_idx = (
+                    pd.Series(sub_src[m_following])
+                    .map(user_to_idx)
+                    .to_numpy(dtype=np.int64, na_value=-1)
+                )
+                t_idx = (
+                    pd.Series(sub_tgt[m_following])
+                    .map(user_to_idx)
+                    .to_numpy(dtype=np.int64, na_value=-1)
+                )
+                keep = (s_idx >= 0) & (t_idx >= 0)
+                if keep.any():
+                    src_list.append(s_idx[keep])
+                    dst_list.append(t_idx[keep])
+                    et_list.append(np.zeros(keep.sum(), dtype=np.int64))
+
+            # followers: reverse target -> source
+            m_followers = rel == "followers"
+            if m_followers.any():
+                s_idx = (
+                    pd.Series(sub_tgt[m_followers])
+                    .map(user_to_idx)
+                    .to_numpy(dtype=np.int64, na_value=-1)
+                )
+                t_idx = (
+                    pd.Series(sub_src[m_followers])
+                    .map(user_to_idx)
+                    .to_numpy(dtype=np.int64, na_value=-1)
+                )
+                keep = (s_idx >= 0) & (t_idx >= 0)
+                if keep.any():
+                    src_list.append(s_idx[keep])
+                    dst_list.append(t_idx[keep])
+                    et_list.append(np.ones(keep.sum(), dtype=np.int64))
+
+            kept_rows += int(mask_keep.sum())
+
+        # Save this chunk’s parts
+        if src_list:
+            src_part = np.concatenate(src_list).astype(np.int64, copy=False)
+            dst_part = np.concatenate(dst_list).astype(np.int64, copy=False)
+            et_part = np.concatenate(et_list).astype(np.int64, copy=False)
+            total_edges += int(len(src_part))
+
+            p_src, p_dst, p_et = _part_paths(chunk_idx)
+            np.save(p_src, src_part)
+            np.save(p_dst, dst_part)
+            np.save(p_et, et_part)
+
+        # Update manifest & periodic logs
+        manifest.update(
+            {
+                "last_done_chunk": chunk_idx,
+                "rows_seen": rows_seen,
+                "kept_rows": kept_rows,
+                "edges": total_edges,
+            }
+        )
+        _save_manifest(manifest)
+
+        if (chunk_idx % 5) == 0 or chunk_idx == start_chunk_idx:
+            logger.info(
+                f"[edges] chunks={chunk_idx:,} rows_seen={rows_seen:,} kept={kept_rows:,} edges={total_edges:,}"
+            )
+            check_ram_guard("During edge build")
+
+    # If there are no part files, return empty graph
+    part_files = sorted(parts_dir.glob("edge_src_part_*.npy"))
+    if not part_files:
+        logger.warning("No edges matched the user set; returning empty graph")
+        return Data(num_nodes=len(user_to_idx))
+
+    # Concatenate all parts (load into RAM to avoid Windows file locks)
+    logger.info("Concatenating edge parts...")
+    src_all, dst_all, et_all = [], [], []
+    done_upto = int(_load_manifest().get("last_done_chunk", -1))
+    for i in tqdm(range(done_upto + 1), desc="Concat parts", unit="part"):
+        p_src, p_dst, p_et = _part_paths(i)
+        if not p_src.exists():  # filtered-out chunk
+            continue
+        src_all.append(np.load(p_src))  # no mmap so we can delete later
+        dst_all.append(np.load(p_dst))
+        et_all.append(np.load(p_et))
+
+    src = np.concatenate(src_all).astype(np.int64, copy=False)
+    dst = np.concatenate(dst_all).astype(np.int64, copy=False)
+    et = np.concatenate(et_all).astype(np.int64, copy=False)
+
+    # Free lists & suggest GC so file handles are released
+    del src_all, dst_all, et_all
+    gc.collect()
+
+    edge_index = torch.from_numpy(np.vstack([src, dst]))
+    edge_type = torch.from_numpy(et)
+    logger.info(
+        f"Graph built: {len(user_to_idx):,} nodes, {edge_index.shape[1]:,} edges (kept_rows={kept_rows:,} of {rows_seen:,})"
+    )
+    check_ram_guard("After graph build")
+
+    # ---------- SAVE FINAL GRAPH CACHE ----------
+    torch.save(
+        {
+            "edge_index": edge_index,
+            "edge_type": edge_type,
+            "num_nodes": len(user_to_idx),
+        },
+        graph_cache,
+    )
+    logger.info(f"Saved final graph cache to {graph_cache}")
+    # -------------------------------------------
+
+    # Cleanup: remove temp parts & manifest (skippable via KEEP_EDGE_PARTS=1)
+    keep_parts = os.getenv("KEEP_EDGE_PARTS", "0") == "1"
+    if not keep_parts:
+        import time, shutil
+
+        def _try_cleanup(retries=5, delay=0.5):
+            for _ in range(retries):
+                try:
+                    for f in parts_dir.glob("edge_*_part_*.npy"):
+                        try:
+                            f.unlink(missing_ok=True)
+                        except PermissionError:
+                            time.sleep(delay)
+                            try:
+                                f.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    if manifest_path.exists():
+                        try:
+                            manifest_path.unlink()
+                        except Exception:
+                            pass
+                    try:
+                        parts_dir.rmdir()
+                    except OSError:
+                        try:
+                            shutil.rmtree(parts_dir, ignore_errors=True)
+                        except Exception:
+                            pass
+                    return
+                except Exception:
+                    time.sleep(delay)
+                    gc.collect()
+            logger.warning("Edge parts cleanup skipped after retries (safe to ignore).")
+
+        _try_cleanup()
+    else:
+        logger.info("KEEP_EDGE_PARTS=1 set — keeping edge_parts on disk for reuse.")
+
+    return Data(edge_index=edge_index, edge_type=edge_type, num_nodes=len(user_to_idx))
+
+
+# -----------------------
+# Model Components
+# -----------------------
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for handling class imbalance (ChatGPT recommendation).
+    Focuses learning on hard examples.
+
+    Args:
+        alpha: weighting factor for class 1 (bots), default 0.75
+        gamma: focusing parameter, default 2.0
+    """
+    def __init__(self, alpha=0.75, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: [N, 2] logits
+            targets: [N] class labels (0 or 1)
+        """
+        BCE_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)  # Probability of correct class
+        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+        return F_loss.mean()
+
+
+class TemporalMLP(nn.Module):
+    """
+    Robust MLP for temporal features (ChatGPT design).
+    Input: 16-dim (15 normalized features + 1 has_tweets bit)
+    Output: 128-dim (same scale as other branches)
+    """
+    def __init__(self, input_dim=16, hidden_dim=64, output_dim=128, dropout=0.2):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.BatchNorm1d(hidden_dim),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class BotRGCN(nn.Module):
+    def __init__(
+        self,
+        des_size=768,
+        tweet_size=768,
+        num_prop_size=6,
+        cat_prop_size=3,
+        temporal_size=16,      # 15 z-scored + 1 has_tweets
+        embed_dim=128,
+        dropout=0.3,
+        modality_dropout_p=0.10,  # NEW: drop whole branches during training
+        temp_gain_init=1.0,       # NEW: learnable scale for temporal branch
+        disable_gate=False        # NEW: bypass fusion gate for testing
+    ):
+        super().__init__()
+        self.dropout = dropout
+        self.modality_dropout_p = modality_dropout_p
+        self.use_modality_dropout = modality_dropout_p > 0.0
+        self.disable_gate = disable_gate
+        self.force_gate_open = False  # ChatGPT Oct 6: warm-up control
+
+        # Fixed 128-d outputs per branch
+        self.linear_des   = nn.Sequential(nn.Linear(des_size,     128), nn.LeakyReLU())
+        self.linear_tweet = nn.Sequential(nn.Linear(tweet_size,   128), nn.LeakyReLU())
+        self.linear_num   = nn.Sequential(nn.Linear(num_prop_size,128), nn.LeakyReLU())
+        self.linear_cat   = nn.Sequential(nn.Linear(cat_prop_size,128), nn.LeakyReLU())
+
+        # Temporal MLP: 16 → 64 → 128
+        self.temporal_mlp = TemporalMLP(input_dim=temporal_size, hidden_dim=64, output_dim=128, dropout=0.2)
+
+        # Fusion: 5×128=640 → LayerNorm → (Gate) → Linear( embed_dim )
+        self.fusion_norm = nn.LayerNorm(640)
+        self.fuse_gate   = nn.Sequential(nn.Linear(640, 640), nn.Sigmoid())  # NEW: learns per-dim weights
+        self.linear_input = nn.Sequential(nn.Linear(640, embed_dim), nn.LeakyReLU())
+
+        # Graph layers
+        self.rgcn1 = RGCNConv(embed_dim, embed_dim, num_relations=NUM_RELATIONS)
+        self.rgcn2 = RGCNConv(embed_dim, embed_dim, num_relations=NUM_RELATIONS)
+
+        # Classifier
+        self.linear_output1 = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.LeakyReLU())
+        self.linear_output2 = nn.Linear(embed_dim, 2)
+
+        # NEW: learnable gain for temporal branch
+        self.temp_gain = nn.Parameter(torch.tensor(float(temp_gain_init), dtype=torch.float32))
+
+    def _modality_drop(self, x: torch.Tensor, is_temporal: bool = False) -> torch.Tensor:
+        if not self.training or not self.use_modality_dropout:
+            return x
+        if self.modality_dropout_p <= 0.0:
+            return x
+
+        # OPTION B: Drop temporal less frequently (only 30% of usual drop rate)
+        if is_temporal:
+            drop_p = self.modality_dropout_p * 0.3
+        else:
+            drop_p = self.modality_dropout_p
+
+        # Drop entire modality with prob p (same mask across batch)
+        keep = (torch.rand(1, device=x.device) > drop_p).float()
+        return x * keep
+
+    def forward(self, des, tweet, num_prop, cat_prop, temporal, edge_index, edge_type):
+        # Branch embeddings
+        d    = self.linear_des(des)
+        t    = self.linear_tweet(tweet)
+        n    = self.linear_num(num_prop)
+        c    = self.linear_cat(cat_prop)
+        temp = self.temporal_mlp(temporal) * self.temp_gain  # scaled temporal
+
+        # Modality dropout (forces model to use all branches)
+        d    = self._modality_drop(d)
+        t    = self._modality_drop(t)
+        n    = self._modality_drop(n)
+        c    = self._modality_drop(c)
+        temp = self._modality_drop(temp, is_temporal=True)  # Drop less frequently
+
+        # Fusion + gate
+        x = torch.cat((d, t, n, c, temp), dim=1)  # [B, 640]
+        x = self.fusion_norm(x)
+
+        # ChatGPT Oct 6: Gate warm-up - let temporal prove itself before clamping
+        if self.disable_gate or self.force_gate_open:
+            # Bypass gate during warm-up or testing
+            pass
+        else:
+            gate = self.fuse_gate(x)              # [B, 640], in (0,1)
+            x = x * gate
+
+        x = self.linear_input(x)                  # [B, embed_dim]
+
+        # Graph reasoning
+        x = F.leaky_relu(self.rgcn1(x, edge_index, edge_type))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = F.leaky_relu(self.rgcn2(x, edge_index, edge_type))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # Head
+        x = self.linear_output1(x)
+        x = self.linear_output2(x)
+        return x
+
+
+# -----------------------
+# Training / Evaluation
+# -----------------------
+def make_loader(
+    data: Data, mask: torch.Tensor, batch_size: int, shuffle: bool
+) -> NeighborLoader:
+    """Create a NeighborLoader over masked nodes. mask must be on CPU."""
+    if mask.dtype == torch.bool:
+        input_nodes = torch.where(mask)[0]
+    else:
+        input_nodes = mask
+    loader_kwargs = {
+        "num_neighbors": NEIGH_NUM,
+        "batch_size": batch_size,
+        "input_nodes": input_nodes,
+        "shuffle": shuffle,
+        "num_workers": LOADER_WORKERS,
+        "pin_memory": PIN_MEMORY,
+    }
+
+    # Only set these if num_workers > 0
+    if LOADER_WORKERS > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
+
+    return NeighborLoader(data, **loader_kwargs)
+
+
+def train_model(
+    model,
+    full_des,
+    full_tweet,
+    full_num,
+    full_cat,
+    full_temporal,  # NEW - torch tensor
+    temporal_feats,  # NEW - numpy array for diagnostics
+    data,
+    labels,
+    train_mask,
+    val_mask,
+    test_mask,
+    optimizer,
+    criterion,
+    epochs,
+    patience,
+):
+    """Train with NeighborLoader; move features to GPU per-batch, not in full."""
+    scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
+
+    # Auto LR decay when Val F1 plateaus
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-5
+    )
+
+    best_f1 = 0.0
+    epochs_no_improve = 0
+
+    # Loaders (masks must be on CPU)
+    train_loader = make_loader(data, train_mask.cpu(), BATCH_SIZE, shuffle=True)
+    val_loader = make_loader(
+        data, val_mask.cpu(), batch_size=BATCH_SIZE, shuffle=False  # Use same as training to avoid OOM
+    )
+
+    # ChatGPT Oct 6: Gate warm-up schedule
+    GATE_WARMUP_EPOCHS = int(os.getenv("GATE_WARMUP", "5"))
+
+    for epoch in range(1, epochs + 1):
+        # Warm-up: force gate open first N epochs to let temporal prove itself
+        model.force_gate_open = (epoch <= GATE_WARMUP_EPOCHS)
+        if model.force_gate_open:
+            logger.info(f"🔥 Epoch {epoch}/{GATE_WARMUP_EPOCHS}: Gate warm-up active (temporal unfiltered)")
+
+        model.train()
+        running_loss = 0.0
+
+        # RAM optimization: fixed-width progress bar, less frequent updates
+        pbar = tqdm(train_loader, desc=f"Train {epoch}/{epochs}", unit="batch",
+                   dynamic_ncols=False, ncols=120, mininterval=1.0, miniters=50)
+        temp_check_done = False
+        gate_stats_done = False
+        for batch in pbar:
+            # Skip degenerate batches
+            if getattr(batch, "batch_size", 0) == 0:
+                continue
+
+            # Indices FIRST on CPU to index CPU feature tensors safely
+            n_id = batch.n_id.cpu()
+
+            # Move sampled subgraph to GPU
+            batch = batch.to(DEVICE, non_blocking=True)
+
+            # Gather features for sampled nodes, then move to GPU
+            des = full_des[n_id].to(DEVICE, non_blocking=True)
+            twt = full_tweet[n_id].to(DEVICE, non_blocking=True)
+            num = full_num[n_id].to(DEVICE, non_blocking=True)
+            cat = full_cat[n_id].to(DEVICE, non_blocking=True)
+            temp = full_temporal[n_id].to(DEVICE, non_blocking=True)  # NEW
+            y = labels[n_id[: batch.batch_size]].to(DEVICE, non_blocking=True)
+
+            # TEMPORAL SANITY CHECK (epoch 1, first batch only)
+            if epoch == 1 and not temp_check_done:
+                with torch.no_grad():
+                    out_real = model(des, twt, num, cat, temp, batch.edge_index, batch.edge_type)[: batch.batch_size]
+                    out_zero = model(des, twt, num, cat, torch.zeros_like(temp), batch.edge_index, batch.edge_type)[: batch.batch_size]
+                    delta = (out_real - out_zero).abs().mean().item()
+                    logger.info(f"[TEMP-CHECK] mean(|logits(real_tmp) - logits(zero_tmp)|) = {delta:.6f}")
+
+                    if delta < 0.001:
+                        logger.warning("⚠️ TEMPORAL BRANCH OUTPUT IS NEAR-ZERO")
+                        logger.warning("   → Gate may be suppressing or MLP is re-zeroing")
+                temp_check_done = True
+
+            # GATE STATISTICS (epoch 1, first batch only)
+            if epoch == 1 and not gate_stats_done:
+                with torch.no_grad():
+                    # Forward through branches only
+                    d_branch = model.linear_des(des)
+                    t_branch = model.linear_tweet(twt)
+                    n_branch = model.linear_num(num)
+                    c_branch = model.linear_cat(cat)
+                    temp_branch = model.temporal_mlp(temp) * model.temp_gain
+
+                    # Branch variance check
+                    logger.info("[BRANCH-VAR] Output variance by branch:")
+                    logger.info(f"  des:      {d_branch.var().item():.6f}")
+                    logger.info(f"  tweet:    {t_branch.var().item():.6f}")
+                    logger.info(f"  num_prop: {n_branch.var().item():.6f}")
+                    logger.info(f"  cat_prop: {c_branch.var().item():.6f}")
+                    logger.info(f"  temporal: {temp_branch.var().item():.6f}")
+
+                    # Fusion gate values
+                    x_fused = torch.cat((d_branch, t_branch, n_branch, c_branch, temp_branch), dim=1)
+                    x_normed = model.fusion_norm(x_fused)
+                    gate_vals = model.fuse_gate(x_normed)
+
+                    # Gate stats for temporal slice (last 128 dims)
+                    temp_gate = gate_vals[:, -128:]
+                    logger.info(f"[GATE-VALS] Temporal gate slice (last 128 dims):")
+                    logger.info(f"  mean: {temp_gate.mean().item():.4f}")
+                    logger.info(f"  std:  {temp_gate.std().item():.4f}")
+                    logger.info(f"  min:  {temp_gate.min().item():.4f}")
+                    logger.info(f"  max:  {temp_gate.max().item():.4f}")
+
+                    if temp_gate.mean().item() < 0.1:
+                        logger.warning("⚠️ GATE IS SUPPRESSING TEMPORAL BRANCH (mean < 0.1)")
+                        logger.warning("   → Consider disabling gate or forcing temp_gain > 1.0")
+
+                gate_stats_done = True
+
+            optimizer.zero_grad(set_to_none=True)
+
+            # Mixed precision forward
+            with torch.autocast(
+                "cuda", enabled=(DEVICE.type == "cuda"), dtype=torch.float16
+            ):
+                out = model(des, twt, num, cat, temp, batch.edge_index, batch.edge_type)
+                loss = criterion(out[: batch.batch_size], y)
+
+            # Backward on scaled loss
+            scaler.scale(loss).backward()
+
+            # Unscale then clip true gradients (prevents fp16 blowups)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Step + update scaler (handles non-finite internally)
+            scaler.step(optimizer)
+            scaler.update()
+
+            # OPTION B: Gate warm-up (nudge temp_gain up smoothly)
+            if hasattr(model, "temp_gain"):
+                with torch.no_grad():
+                    target = min(1.0, epoch / 10.0)  # 0→1 in first 10 epochs
+                    model.temp_gain.clamp_(0.0, 1.0)
+                    model.temp_gain.mul_(0.9).add_(0.1 * target)
+
+            running_loss += float(loss.item())
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            # Cleanup
+            del des, twt, num, cat, temp, y, batch, n_id
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
+
+        # --- Epoch summary ---
+        avg_loss = running_loss / max(1, len(train_loader))
+        logger.info(f"Epoch {epoch:03d} | Loss: {avg_loss:.4f}")
+
+        # -------- Validation (mini-batches; no full-graph forward) --------
+        logger.info(f"🔍 Starting validation loop 1/2 (with temporal features)...")
+        model.eval()
+        all_pred, all_true = [], []
+        batch_count = 0
+        try:
+            with torch.no_grad():
+                for vb in tqdm(val_loader, desc="Validate", unit="batch", leave=False,
+                              dynamic_ncols=False, ncols=120, mininterval=1.0):
+                    batch_count += 1
+                    n_id = vb.n_id.cpu()
+                    vb = vb.to(DEVICE, non_blocking=True)
+
+                    des = full_des[n_id].to(DEVICE, non_blocking=True)
+                    twt = full_tweet[n_id].to(DEVICE, non_blocking=True)
+                    num = full_num[n_id].to(DEVICE, non_blocking=True)
+                    cat = full_cat[n_id].to(DEVICE, non_blocking=True)
+                    temp = full_temporal[n_id].to(DEVICE, non_blocking=True)
+
+                    out = model(des, twt, num, cat, temp, vb.edge_index, vb.edge_type)
+                    pred = out[: vb.batch_size].argmax(dim=1).detach().cpu()
+                    true = labels[n_id[: vb.batch_size]].detach().cpu()
+
+                    all_pred.append(pred)
+                    all_true.append(true)
+
+                    del des, twt, num, cat, temp, vb, n_id
+                    if DEVICE.type == "cuda":
+                        torch.cuda.empty_cache()
+        except Exception as e:
+            logger.error(f"❌ Validation loop 1 crashed at batch {batch_count}: {e}")
+            import traceback
+            traceback.print_exc()
+
+        logger.info(f"✅ Validation loop 1 complete: processed {batch_count} batches")
+
+        if all_true:
+            y_true = torch.cat(all_true).numpy()
+            y_pred = torch.cat(all_pred).numpy()
+            val_f1 = f1_score(y_true, y_pred)
+            logger.info(f"📊 Val F1 (with temporal): {val_f1:.3f}")
+        else:
+            val_f1 = 0.0
+            logger.warning(f"⚠️ No validation data collected!")
+
+        # --------- Ablation: temporal = 0 (prove impact) ---------
+        logger.info(f"🔍 Starting validation loop 2/2 (temporal=0 ablation)...")
+        all_pred0, all_true0 = [], []
+        batch_count0 = 0
+        with torch.no_grad():
+            for vb in tqdm(val_loader, desc="Validate(tmp=0)", unit="batch", leave=False,
+                          dynamic_ncols=False, ncols=120, mininterval=1.0):
+                batch_count0 += 1
+                n_id = vb.n_id.cpu()
+                vb = vb.to(DEVICE, non_blocking=True)
+
+                des  = full_des[n_id].to(DEVICE, non_blocking=True)
+                twt  = full_tweet[n_id].to(DEVICE, non_blocking=True)
+                num  = full_num[n_id].to(DEVICE, non_blocking=True)
+                cat  = full_cat[n_id].to(DEVICE, non_blocking=True)
+                temp = torch.zeros_like(full_temporal[n_id]).to(DEVICE, non_blocking=True)
+
+                out0  = model(des, twt, num, cat, temp, vb.edge_index, vb.edge_type)
+                pred0 = out0[: vb.batch_size].argmax(dim=1).detach().cpu()
+                true0 = labels[n_id[: vb.batch_size]].detach().cpu()
+
+                all_pred0.append(pred0)
+                all_true0.append(true0)
+
+                del des, twt, num, cat, temp, vb, n_id
+                if DEVICE.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        logger.info(f"✅ Validation loop 2 complete: processed {batch_count0} batches")
+
+        if all_true0:
+            y_true0 = torch.cat(all_true0).numpy()
+            y_pred0 = torch.cat(all_pred0).numpy()
+            val_f1_tmp0 = f1_score(y_true0, y_pred0)
+        else:
+            val_f1_tmp0 = 0.0
+
+        logger.info(f"[ABLATE] Val F1 with temporal=0: {val_f1_tmp0:.3f} (Δ={val_f1 - val_f1_tmp0:+.3f})")
+
+        # Log temporal gain parameter (shows if model is learning to suppress temporal)
+        temp_gain_val = float(model.temp_gain.item())
+        logger.info(f"[TEMP-GAIN] Current value: {temp_gain_val:.4f}")
+
+        # --- Save best & early-stopping bookkeeping ---
+        improved = val_f1 > best_f1
+        if improved:
+            best_f1 = val_f1
+            # Save with timestamp to preserve history
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            model_path = CACHE_DIR / f"botrgcn_t16_best_{timestamp}_f1{val_f1:.3f}.pt"
+            torch.save(model.state_dict(), model_path)
+            logger.info(f"💾 Saved new best model: {model_path.name}")
+            # Also save as "latest" for easy loading
+            torch.save(model.state_dict(), CACHE_DIR / "botrgcn_t16_best.pt")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        logger.info(
+            f"Epoch {epoch:03d} | Loss: {avg_loss:.4f} | Val F1: {val_f1:.3f} | Best: {best_f1:.3f} | NoImprove: {epochs_no_improve}"
+        )
+
+        # Step LR scheduler on validation signal
+        scheduler.step(val_f1)
+        logger.info(f"Current LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+        if epochs_no_improve >= patience:
+            logger.info(f"Early stopping at epoch {epoch}")
+            break
+
+        # ------------------------ Final Test with threshold tuning ------------------------
+    # Load best weights
+    model.load_state_dict(
+        torch.load(CACHE_DIR / "botrgcn_t16_best.pt", map_location=DEVICE)
+    )
+    model.eval()
+
+    # 1) Find best threshold on VALIDATION set
+    val_loader_for_thr = make_loader(
+        data, val_mask.cpu(), batch_size=max(1024, BATCH_SIZE), shuffle=False
+    )
+    val_true, val_score = [], []
+    with torch.no_grad():
+        for vb in tqdm(
+            val_loader_for_thr, desc="Val(threshold)", unit="batch", leave=False,
+            dynamic_ncols=False, ncols=120, mininterval=1.0
+        ):
+            n_id = vb.n_id.cpu()
+            vb = vb.to(DEVICE, non_blocking=True)
+
+            des = full_des[n_id].to(DEVICE, non_blocking=True)
+            twt = full_tweet[n_id].to(DEVICE, non_blocking=True)
+            num = full_num[n_id].to(DEVICE, non_blocking=True)
+            cat = full_cat[n_id].to(DEVICE, non_blocking=True)
+            temp = full_temporal[n_id].to(DEVICE, non_blocking=True)  # NEW
+
+            logits = model(des, twt, num, cat, temp, vb.edge_index, vb.edge_type)[
+                : vb.batch_size
+            ]
+            probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu()  # P(bot)
+
+            val_score.append(probs)
+            val_true.append(labels[n_id[: vb.batch_size]].detach().cpu())
+
+            del des, twt, num, cat, temp, vb, n_id
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
+
+    val_true = torch.cat(val_true).numpy()
+    val_score = torch.cat(val_score).numpy()
+
+    from sklearn.metrics import precision_recall_curve
+
+    prec, rec, thr = precision_recall_curve(val_true, val_score)
+    f1s = 2 * prec * rec / (prec + rec + 1e-12)
+    best_idx = f1s.argmax()
+    best_thr = float(thr[best_idx]) if thr.size else 0.5
+    logger.info(
+        f"Best VAL threshold={best_thr:.3f} | ValF1@best={f1s[best_idx]:.3f} (P={prec[best_idx]:.3f}, R={rec[best_idx]:.3f})"
+    )
+
+    # 2) Evaluate TEST set at that threshold
+    test_loader = make_loader(
+        data, test_mask.cpu(), batch_size=max(1024, BATCH_SIZE), shuffle=False
+    )
+    test_true, test_pred, test_probs = [], [], []  # ChatGPT Oct 6: Added test_probs for AUPRC
+    with torch.no_grad():
+        for tb in tqdm(test_loader, desc="Test", unit="batch",
+                       dynamic_ncols=False, ncols=120, mininterval=1.0):
+            n_id = tb.n_id.cpu()
+            tb = tb.to(DEVICE, non_blocking=True)
+
+            des = full_des[n_id].to(DEVICE, non_blocking=True)
+            twt = full_tweet[n_id].to(DEVICE, non_blocking=True)
+            num = full_num[n_id].to(DEVICE, non_blocking=True)
+            cat = full_cat[n_id].to(DEVICE, non_blocking=True)
+            temp = full_temporal[n_id].to(DEVICE, non_blocking=True)  # NEW
+
+            logits = model(des, twt, num, cat, temp, tb.edge_index, tb.edge_type)[
+                : tb.batch_size
+            ]
+            probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu()
+            pred = (probs >= best_thr).long()
+
+            test_pred.append(pred)
+            test_probs.append(probs)  # ChatGPT Oct 6: Collect probs for AUPRC
+            test_true.append(labels[n_id[: tb.batch_size]].detach().cpu())
+
+            del des, twt, num, cat, temp, tb, n_id
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
+
+    y_true = torch.cat(test_true).numpy() if test_true else np.empty(0, dtype=np.int64)
+    y_pred = torch.cat(test_pred).numpy() if test_pred else np.empty(0, dtype=np.int64)
+    test_f1 = f1_score(y_true, y_pred) if y_true.size > 0 else 0.0
+
+    # ChatGPT Oct 6: Add AUPRC (better for class imbalance than F1)
+    test_auprc = 0.0
+    if y_true.size > 0 and len(test_probs) > 0:
+        probs_np = torch.cat(test_probs).numpy()  # Already single-class probs (bot probability)
+        test_auprc = average_precision_score(y_true, probs_np)  # ChatGPT Oct 6 fix: probs already P(bot)
+        logger.info(f"📊 Test AUPRC (Bot class): {test_auprc:.4f} (area under PR curve)")
+
+    # 3) Log full report and persist threshold
+    logger.info(f"Test F1@thr={best_thr:.3f}: {test_f1:.3f}")
+    print(classification_report(y_true, y_pred, target_names=["Human", "Bot"]))
+
+    # ========================================================================
+    # TWO-THRESHOLD CALIBRATION (has_tweets vs no_tweets)
+    # ========================================================================
+    logger.info("\n" + "="*80)
+    logger.info("TWO-THRESHOLD CALIBRATION (stratified by has_tweets)")
+    logger.info("="*80)
+
+    def _collect_ids_probs_true(loader):
+        ids, probs, true = [], [], []
+        with torch.no_grad():
+            for b in loader:
+                n_id = b.n_id.cpu()
+                bd = b.to(DEVICE, non_blocking=True)
+
+                des = full_des[n_id].to(DEVICE, non_blocking=True)
+                twt = full_tweet[n_id].to(DEVICE, non_blocking=True)
+                num = full_num[n_id].to(DEVICE, non_blocking=True)
+                cat = full_cat[n_id].to(DEVICE, non_blocking=True)
+                tmp = full_temporal[n_id].to(DEVICE, non_blocking=True)
+
+                logits = model(des, twt, num, cat, tmp, bd.edge_index, bd.edge_type)[: bd.batch_size]
+                p = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+                y = labels[n_id[: bd.batch_size]].cpu().numpy()
+
+                ids.append(n_id[: bd.batch_size].numpy())
+                probs.append(p)
+                true.append(y)
+
+                del des, twt, num, cat, tmp, bd, n_id
+                if DEVICE.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        return np.concatenate(ids), np.concatenate(probs), np.concatenate(true)
+
+    def _best_thr(probs, true):
+        if probs.size == 0:
+            return 0.5, 0.0
+        best, thr = 0.0, 0.5
+        for t in np.linspace(0.05, 0.95, 181):
+            f = f1_score(true, (probs >= t).astype(np.int64))
+            if f > best:
+                best, thr = f, t
+        return thr, best
+
+    # VAL calibration
+    val_loader_2thr = make_loader(data, val_mask.cpu(), batch_size=max(1024, BATCH_SIZE), shuffle=False)
+    v_ids, v_probs, v_true = _collect_ids_probs_true(val_loader_2thr)
+    v_has = (full_temporal[v_ids, -1].cpu().numpy() > 0.5)
+
+    thr_has, f1_has = _best_thr(v_probs[v_has], v_true[v_has]) if v_has.any() else (0.5, 0.0)
+    thr_noh, f1_noh = _best_thr(v_probs[~v_has], v_true[~v_has]) if (~v_has).any() else (0.5, 0.0)
+    logger.info(f"[VAL two-thr] has_tweets=1 thr={thr_has:.3f} (F1={f1_has:.3f}) | has_tweets=0 thr={thr_noh:.3f} (F1={f1_noh:.3f})")
+
+    # TEST apply
+    test_loader_2thr = make_loader(data, test_mask.cpu(), batch_size=max(1024, BATCH_SIZE), shuffle=False)
+    t_ids, t_probs, t_true = _collect_ids_probs_true(test_loader_2thr)
+    t_has = (full_temporal[t_ids, -1].cpu().numpy() > 0.5)
+
+    t_pred_2thr = np.empty_like(t_true)
+    t_pred_2thr[t_has] = (t_probs[t_has] >= thr_has).astype(np.int64)
+    t_pred_2thr[~t_has] = (t_probs[~t_has] >= thr_noh).astype(np.int64)
+
+    overall_f1_2thr = f1_score(t_true, t_pred_2thr)
+    f1_ht = f1_score(t_true[t_has], t_pred_2thr[t_has]) if t_has.any() else 0.0
+    f1_noh = f1_score(t_true[~t_has], t_pred_2thr[~t_has]) if (~t_has).any() else 0.0
+    logger.info(f"[TEST two-thr] Overall F1={overall_f1_2thr:.3f} | F1(has_tweets=1)={f1_ht:.3f} | F1(has_tweets=0)={f1_noh:.3f}")
+    logger.info(f"[GAIN] Two-threshold vs single: {overall_f1_2thr - test_f1:+.3f} F1 points")
+
+    print("\nTwo-Threshold Classification Report:")
+    print(classification_report(t_true, t_pred_2thr, target_names=["Human", "Bot"]))
+    logger.info("="*80)
+
+    # ========================================================================
+    # DIAGNOSTIC 1: TEMP-ONLY PROBE - Does temporal alone have signal?
+    # ========================================================================
+    logger.info("\n" + "="*80)
+    logger.info("DIAGNOSTIC 1: TEMP-ONLY PROBE (Logistic Regression on 15 temporal dims)")
+    logger.info("="*80)
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import f1_score as sklearn_f1
+
+        # Get temporal features for train/val
+        temp_train = temporal_feats[train_mask.numpy()][:, :15]
+        temp_val = temporal_feats[val_mask.numpy()][:, :15]
+        labels_train_np = labels[train_mask].numpy()
+        labels_val_np = labels[val_mask].numpy()
+
+        # Train simple logistic regression on JUST temporal
+        lr = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
+        lr.fit(temp_train, labels_train_np)
+
+        # Predict on validation
+        val_pred = lr.predict(temp_val)
+        temp_only_f1 = sklearn_f1(labels_val_np, val_pred, average='binary', pos_label=1)
+
+        logger.info(f"[TEMP-ONLY] Val Bot F1 using ONLY 15 temporal features: {temp_only_f1:.4f}")
+
+        if temp_only_f1 >= 0.62:
+            logger.info("✅ TEMPORAL HAS STRONG STANDALONE SIGNAL (≥0.62)")
+            logger.info("   → Fusion may be muting it; try gate warm-up or less dropout")
+        elif temp_only_f1 >= 0.58:
+            logger.info("⚠️  TEMPORAL HAS MODERATE SIGNAL (0.58-0.62)")
+            logger.info("   → Marginal contribution; improvements may help")
+        else:
+            logger.info("❌ TEMPORAL SIGNAL IS WEAK (<0.58)")
+            logger.info("   → Consider better temporal features (circadian PCA, weekend deltas)")
+    except Exception as e:
+        logger.warning(f"TEMP-ONLY probe failed: {e}")
+
+    # ========================================================================
+    # DIAGNOSTIC 2: STRATIFIED TEST BY has_tweets
+    # ========================================================================
+    logger.info("\n" + "="*80)
+    logger.info("DIAGNOSTIC 2: STRATIFIED TEST F1 by has_tweets")
+    logger.info("="*80)
+    try:
+        # Get has_tweets column (16th dim, index 15)
+        test_has_tweets = temporal_feats[test_mask.numpy()][:, 15]
+
+        # Split test into two groups
+        has_tweets_idx = test_has_tweets > 0.5
+        no_tweets_idx = test_has_tweets <= 0.5
+
+        # Calculate F1 for each group
+        if has_tweets_idx.sum() > 0:
+            y_true_with = y_true[has_tweets_idx]
+            y_pred_with = y_pred[has_tweets_idx]
+            f1_with_tweets = sklearn_f1(y_true_with, y_pred_with, average='binary', pos_label=1)
+            logger.info(f"[STRATIFIED] Test Bot F1 (has_tweets=1): {f1_with_tweets:.4f} | N={has_tweets_idx.sum()}")
+        else:
+            logger.info("[STRATIFIED] No test users with tweets!")
+            f1_with_tweets = 0.0
+
+        if no_tweets_idx.sum() > 0:
+            y_true_without = y_true[no_tweets_idx]
+            y_pred_without = y_pred[no_tweets_idx]
+            f1_without_tweets = sklearn_f1(y_true_without, y_pred_without, average='binary', pos_label=1)
+            logger.info(f"[STRATIFIED] Test Bot F1 (has_tweets=0): {f1_without_tweets:.4f} | N={no_tweets_idx.sum()}")
+        else:
+            logger.info("[STRATIFIED] No test users without tweets!")
+            f1_without_tweets = 0.0
+
+        # Interpret
+        if f1_with_tweets > test_f1 + 0.01:
+            logger.info("✅ TEMPORAL HELPS USERS WITH TWEETS!")
+            logger.info(f"   → Gain for tweet-users: +{(f1_with_tweets - test_f1)*100:.1f}%")
+            logger.info("   → Overall F1 diluted by users without tweet history")
+        else:
+            logger.info("❌ No clear temporal benefit even for users with tweets")
+    except Exception as e:
+        logger.warning(f"Stratified test failed: {e}")
+
+    # ========================================================================
+    # DIAGNOSTIC 3: ALTERNATIVE VALIDATION SLICES (K=3) + CV THRESHOLD
+    # ========================================================================
+    logger.info("\n" + "="*80)
+    logger.info("DIAGNOSTIC 3: ALTERNATIVE VAL SLICES (K=3) + CV THRESHOLD")
+    logger.info("="*80)
+    try:
+        import random
+
+        # Get all validation indices
+        val_indices = torch.where(val_mask)[0].numpy()
+        labels_np = labels.numpy()
+
+        # Create 3 stratified alternative validation sets (each 200k)
+        val_size = 200000
+        alt_val_f1s = []
+        alt_thresholds = []
+
+        for k in range(3):
+            # Stratified sampling
+            bot_indices = val_indices[labels_np[val_indices] == 1]
+            human_indices = val_indices[labels_np[val_indices] == 0]
+
+            # Sample proportionally
+            n_bots = int(val_size * 0.14)  # 14% bots
+            n_humans = val_size - n_bots
+
+            np.random.seed(42 + k)  # Different seed for each fold
+            sampled_bots = np.random.choice(bot_indices, min(n_bots, len(bot_indices)), replace=False)
+            sampled_humans = np.random.choice(human_indices, min(n_humans, len(human_indices)), replace=False)
+
+            alt_val_idx = np.concatenate([sampled_bots, sampled_humans])
+
+            # Create mask for this alternative val set
+            alt_val_mask_k = torch.zeros(len(labels), dtype=torch.bool)
+            alt_val_mask_k[alt_val_idx] = True
+
+            # Evaluate model on this alt val set to find best threshold
+            val_loader_k = make_loader(data, alt_val_mask_k, BATCH_SIZE, shuffle=False)
+
+            all_probs_k = []
+            all_labels_k = []
+
+            with torch.no_grad():
+                for batch in val_loader_k:
+                    n_id = batch.n_id.cpu()
+                    batch = batch.to(DEVICE, non_blocking=True)
+
+                    # Use full_* arrays instead of batch.x_*
+                    des = full_des[n_id].to(DEVICE, non_blocking=True)
+                    twt = full_tweet[n_id].to(DEVICE, non_blocking=True)
+                    num = full_num[n_id].to(DEVICE, non_blocking=True)
+                    cat = full_cat[n_id].to(DEVICE, non_blocking=True)
+                    temp = full_temporal[n_id].to(DEVICE, non_blocking=True)
+
+                    out = model(des, twt, num, cat, temp, batch.edge_index, batch.edge_type)[: batch.batch_size]
+                    probs = torch.sigmoid(out[:, 1] - out[:, 0])
+
+                    all_probs_k.append(probs.cpu())
+                    all_labels_k.append(labels[n_id[: batch.batch_size]].cpu())
+
+            probs_k = torch.cat(all_probs_k).numpy()
+            labels_k = torch.cat(all_labels_k).numpy()
+
+            # Sweep thresholds on this alt val set
+            thresholds_k = np.linspace(0.15, 0.85, 50)
+            best_f1_k = 0.0
+            best_thr_k = 0.5
+
+            for thr in thresholds_k:
+                preds = (probs_k >= thr).astype(int)
+                f1_val = sklearn_f1(labels_k, preds, average='binary', pos_label=1)
+                if f1_val > best_f1_k:
+                    best_f1_k = f1_val
+                    best_thr_k = thr
+
+            alt_val_f1s.append(best_f1_k)
+            alt_thresholds.append(best_thr_k)
+            logger.info(f"[ALT-VAL-{k+1}] Best threshold: {best_thr_k:.3f} | Val F1: {best_f1_k:.3f}")
+
+        # Calculate mean and variance
+        mean_f1 = np.mean(alt_val_f1s)
+        std_f1 = np.std(alt_val_f1s)
+        mean_thr = np.mean(alt_thresholds)
+
+        logger.info(f"\n[CV-SUMMARY] Mean Val F1: {mean_f1:.3f} ± {std_f1:.3f}")
+        logger.info(f"[CV-SUMMARY] Mean threshold: {mean_thr:.3f} (original: {best_thr:.3f})")
+
+        if std_f1 > 0.02:
+            logger.info("⚠️  HIGH VARIANCE across val slices (±{:.3f})".format(std_f1))
+            logger.info("   → Fixed val set may be biasing calibration")
+            logger.info("   → Consider using CV threshold or reshuffling val set")
+        else:
+            logger.info("✅ LOW VARIANCE across val slices (±{:.3f})".format(std_f1))
+            logger.info("   → Plateau is real, not caused by val selection")
+
+    except Exception as e:
+        logger.warning(f"Alt-val CV failed: {e}")
+
+    logger.info("\n" + "="*80)
+    logger.info("END DIAGNOSTICS")
+    logger.info("="*80 + "\n")
+
+    try:
+        import json
+
+        (CACHE_DIR / "eval_threshold.json").write_text(
+            json.dumps({"threshold": best_thr}, indent=2)
+        )
+    except Exception:
+        pass
+
+    # Return all metrics needed for inference bundle
+    return {
+        'test_f1': test_f1,
+        'best_thr': best_thr,
+        'thr_has': thr_has,
+        'thr_noh': thr_noh,
+        'test_auprc': test_auprc,
+        'overall_f1_2thr': overall_f1_2thr,
+        'f1_ht': f1_ht,
+        'f1_noh': f1_noh
+    }
+
+
+# -----------------------
+# Main
+# -----------------------
+def main():
+    # Set global seed for reproducibility (ChatGPT Oct 6 recommendation)
+    set_global_seed(int(os.getenv("SEED", "42")))
+
+    # -- START MODIFICATION (Curtis Oct 6: Timestamp Autopsy) --
+    # Initialize global counters for the audit
+    global total_timestamps_processed, total_timestamps_failed
+    total_timestamps_processed = 0
+    total_timestamps_failed = 0
+    # -- END MODIFICATION --
+
+    start_time = datetime.now()
+    logger.info("Starting BotRGCN Parallel Pipeline (progress+safe RAM)...")
+    check_ram_guard("Start")
+
+    # Load & Filter
+    labels_df = load_labels()
+    splits_df = load_splits()
+
+    users = load_users_chunked(allowed_ids=set(labels_df["id"].astype(str)))
+    # Strip 'u' prefix already done above; just ensure filtering to labeled set
+    labeled_ids = set(labels_df["id"].astype(str))
+    users = [u for u in users if str(u["id"]) in labeled_ids]
+    # Extract fields early to free 'users' later
+    user_ids = [str(u["id"]) for u in users]
+    user_descriptions = [u.get("description", "None") for u in users]
+
+    # Indexes & masks
+    user_to_idx = {uid: i for i, uid in enumerate(user_ids)}
+    # Align labels and splits to user_ids robustly
+    lab_series = (
+        labels_df.set_index("id").reindex(user_ids)["label"].fillna(0).astype(int)
+    )
+    labels = torch.tensor(lab_series.to_numpy(), dtype=torch.long)
+
+    split_series = splits_df.set_index("id").reindex(user_ids)["split"].fillna("train")
+    train_mask = torch.tensor((split_series == "train").to_numpy(), dtype=torch.bool)
+    val_mask = torch.tensor((split_series == "val").to_numpy(), dtype=torch.bool)
+    test_mask = torch.tensor((split_series == "test").to_numpy(), dtype=torch.bool)
+
+    logger.info(
+        f"Users: {len(user_ids):,} | train={int(train_mask.sum())} val={int(val_mask.sum())} test={int(test_mask.sum())}"
+    )
+    check_ram_guard("After indexing")
+
+    # Caches
+    des_cache = CACHE_DIR / "des_embeddings.npy"
+    tweet_cache = CACHE_DIR / "tweet_embeddings.npy"
+    num_cache = CACHE_DIR / "num_props.npy"
+    cat_cache = CACHE_DIR / "cat_props.npy"
+    temporal_cache = CACHE_DIR / "temporal_features.npy"  # NEW
+
+    # Curtis Oct 6: Allow forcing cache rebuild for diagnostics
+    FORCE_REBUILD = os.getenv("FORCE_REBUILD", "0") == "1"
+    if FORCE_REBUILD:
+        logger.warning("⚠️  FORCE_REBUILD=1 detected - will recompute all features (ignoring cache)")
+
+    if (
+        not FORCE_REBUILD
+        and des_cache.exists()
+        and tweet_cache.exists()
+        and num_cache.exists()
+        and cat_cache.exists()
+        and temporal_cache.exists()  # NEW
+    ):
+        logger.info("Loading cached embeddings and features...")
+        # Curtis Oct 6: Load as writable arrays (not mmap) to avoid PyTorch warning
+        # "The given NumPy array is not writable, and PyTorch does not support non-writable tensors"
+        des_emb = np.load(des_cache)
+        tweet_emb = np.load(tweet_cache)
+        num_props = np.load(num_cache)
+        cat_props = np.load(cat_cache)
+        temporal_feats = np.load(temporal_cache)  # NEW
+        logger.info(
+            f"Loaded from cache: des={des_emb.shape}, tweet={tweet_emb.shape}, num={num_props.shape}, cat={cat_props.shape}, temporal={temporal_feats.shape}"
+        )
+
+        # --- AUDIT: Analyze temporal features from cache ---
+        logger.info("=" * 60)
+        logger.info("📊 TEMPORAL FEATURE AUDIT (FROM CACHE)")
+        has_tweets_bit = temporal_feats[:, 15]  # Last column is has_tweets indicator
+        users_with_tweets = int(np.sum(has_tweets_bit))
+        total_users = len(temporal_feats)
+        logger.info(f"Total Users: {total_users}")
+        logger.info(f"Users with has_tweets=1: {users_with_tweets}")
+        if total_users > 0:
+            coverage_pct = (users_with_tweets / total_users * 100)
+            logger.info(f"Tweet Coverage: {coverage_pct:.2f}%")
+
+        # Check if temporal features (first 15 dims) are non-zero - SPLIT BY has_tweets
+        has_tweets_mask = has_tweets_bit == 1
+        no_tweets_mask = has_tweets_bit == 0
+
+        logger.info("")
+        logger.info("--- Users WITH tweets (has_tweets=1) ---")
+        if np.sum(has_tweets_mask) > 0:
+            with_tweets_feats = temporal_feats[has_tweets_mask, :15]
+            mean_with = np.mean(np.abs(with_tweets_feats))
+            std_with = np.std(with_tweets_feats)
+            logger.info(f"  Mean absolute value: {mean_with:.6f}")
+            logger.info(f"  Std deviation: {std_with:.6f}")
+            logger.info(f"  Per-feature means: {np.mean(np.abs(with_tweets_feats), axis=0)[:5]}")  # First 5 features
+            if mean_with < 0.001:
+                logger.warning("  ⚠️ TEMPORAL FEATURES ARE NEAR-ZERO for users WITH tweets!")
+
+        logger.info("")
+        logger.info("--- Users WITHOUT tweets (has_tweets=0) ---")
+        if np.sum(no_tweets_mask) > 0:
+            without_tweets_feats = temporal_feats[no_tweets_mask, :15]
+            mean_without = np.mean(np.abs(without_tweets_feats))
+            std_without = np.std(without_tweets_feats)
+            logger.info(f"  Mean absolute value: {mean_without:.6f}")
+            logger.info(f"  Std deviation: {std_without:.6f}")
+            logger.info(f"  Per-feature means: {np.mean(np.abs(without_tweets_feats), axis=0)[:5]}")
+            if mean_without < 0.001:
+                logger.info("  ✓ Expected: users without tweets should have zero temporal features")
+            elif mean_without > 0.001:
+                logger.warning(f"  ⚠️ UNEXPECTED: users WITHOUT tweets have non-zero temporal features (mean={mean_without:.6f})!")
+
+        logger.info("=" * 60)
+
+        # --- APPLY FIX TO CACHED DATA ---
+        # If loading from cache, make writable copy and apply the zero-out fix
+        no_tweets_mask = temporal_feats[:, 15] == 0
+        if np.sum(no_tweets_mask) > 0:
+            # Make writable copy (mmap is read-only)
+            temporal_feats = np.array(temporal_feats, copy=True)
+            temporal_feats[no_tweets_mask, :15] = 0.0
+            logger.info(f"✅ Applied temporal zero-out fix to {np.sum(no_tweets_mask)} cached users without tweets")
+
+    else:
+        logger.info("Cache not found - extracting features from scratch...")
+
+        # -------------- TEXT EMBEDDING CHECKPOINT (strings) --------------
+        tweets_text_ckpt = CACHE_DIR / "tweets_loaded.pkl"  # strings only
+
+        tweet_text_chunks = None
+        if tweets_text_ckpt.exists():
+            logger.info("Loading tweet TEXT checkpoint (strings) for HF embeddings...")
+            import pickle
+            with open(tweets_text_ckpt, "rb") as f:
+                tweet_text_chunks = pickle.load(f)
+            # Basic sanity: expect list[str]
+            if not tweet_text_chunks or not isinstance(tweet_text_chunks[0], (str,)):
+                logger.warning("tweets_loaded.pkl isn't a list[str]; ignoring and rebuilding from JSON.")
+                tweet_text_chunks = None
+
+        # -------------- LOAD STRUCTURED TWEETS FOR TEMPORAL --------------
+        # We always need structured tweets (List[Dict]) to compute temporal features.
+        # If temporal cache is missing, reload JSON (even if we have the string checkpoint).
+        need_temporal = not temporal_cache.exists()
+        user_id_to_tweets = None
+
+        # -------------- SKIP TEXT CHUNKS (use memmap extraction instead) --------------
+        # ChatGPT Solution: Don't build tweet_text_chunks list (causes RAM explosion)
+        # Instead, extract embeddings directly to memmap in the next section
+        tweet_text_chunks = None  # Will be skipped
+
+        # -------------------- DESCRIPTION EMBEDDINGS ---------------------
+        if not des_cache.exists():
+            logger.info("Extracting description embeddings...")
+            pool_n = decide_pool_workers(NUM_WORKERS, est_worker_gb=1.2)
+            # chunk user_descriptions as before ...
+            chunk_size = math.ceil(len(user_descriptions) / max(1, NUM_WORKERS))
+            des_chunks = [user_descriptions[i:i+chunk_size] for i in range(0, len(user_descriptions), chunk_size)]
+            des_emb = parallel_extract_embeddings(des_chunks, extract_des_embeddings_worker, pool_n, HF_BATCH)
+            np.save(des_cache, des_emb)
+            logger.info(f"Saved description embeddings to {des_cache}")
+        else:
+            des_emb = np.load(des_cache)  # Curtis Oct 6: Load as writable (not mmap)
+
+        # ----------------------- TWEET EMBEDDINGS (MEMMAP + PER-TWEET) ------------------------
+        if not tweet_cache.exists():
+            logger.info("🔥 ChatGPT Solution: Per-tweet encoding with memmap (NO TRUNCATION, NO RAM EXPLOSION)")
+            from numpy.lib.format import open_memmap
+            from tweet_store import TweetStore
+
+            # Pre-allocate memmap (writes directly to disk)
+            N = len(user_ids)
+            tweet_emb_mm = open_memmap(tweet_cache, mode="w+", dtype="float32", shape=(N, 768))
+            logger.info(f"✅ Created tweet embedding memmap: {tweet_cache} ({N:,} × 768)")
+
+            # Load HF model once
+            tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME)
+            mdl = AutoModel.from_pretrained(
+                HF_MODEL_NAME,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            ).to(DEVICE).eval()
+            logger.info(f"✅ Loaded {HF_MODEL_NAME} on {DEVICE}")
+
+            # Ensure dupsort LMDB exists
+            dupsort_lmdb_path = Path("/home/the-architect/Reflexion_ultimate/vigilante/tweets_dupsort.lmdb")
+            if not dupsort_lmdb_path.exists():
+                logger.error(f"❌ Dupsort LMDB not found at {dupsort_lmdb_path}")
+                logger.error("   Run: python build_tweets_lmdb_dupsort.py")
+                raise FileNotFoundError(f"Dupsort LMDB not found. Run build_tweets_lmdb_dupsort.py first.")
+
+            # Open dupsort LMDB
+            store = TweetStore(dupsort_lmdb_path)
+
+            # Process in 50K user batches
+            BATCH_USERS = 50000
+            num_batches = (N + BATCH_USERS - 1) // BATCH_USERS
+            logger.info(f"Processing {num_batches} batches of {BATCH_USERS:,} users each")
+
+            for batch_idx in range(num_batches):
+                s = batch_idx * BATCH_USERS
+                e = min(s + BATCH_USERS, N)
+                batch_uids = user_ids[s:e]
+
+                logger.info(f"📦 Batch {batch_idx + 1}/{num_batches}: users {s:,} to {e:,}")
+
+                # Fetch tweets per user
+                tweet_texts_per_user = []
+                MAX_TWEETS_PER_USER = 200  # Cap to prevent GPU OOM on power users
+                for uid in tqdm(batch_uids, desc=f"  Loading batch {batch_idx + 1}", unit="u"):
+                    tweets = list(store.iter_user_tweets(uid))
+                    tweet_texts = [tw.get("text", "") for tw in tweets[:MAX_TWEETS_PER_USER]]  # Cap tweets
+                    tweet_texts_per_user.append(tweet_texts)
+
+                # Per-tweet encoding with max pooling
+                logger.info(f"  🔥 Encoding {len(tweet_texts_per_user)} users (NO TRUNCATION, MAX POOLING)...")
+                batch_embs = []
+                for user_idx, user_tweets in enumerate(tqdm(tweet_texts_per_user, desc=f"  Encoding batch {batch_idx + 1}", unit="u", leave=False)):
+                    if not user_tweets:
+                        batch_embs.append(np.zeros(768, dtype=np.float32))
+                        continue
+
+                    # Encode all tweets for this user
+                    tweet_embs = []
+                    for i in range(0, len(user_tweets), HF_BATCH):
+                        texts = user_tweets[i:i+HF_BATCH]
+                        enc = tokenizer(texts, return_tensors="pt", truncation=True, max_length=192, padding=True)
+                        enc = {k: v.to(DEVICE, non_blocking=True) for k, v in enc.items()}
+
+                        with torch.no_grad(), torch.autocast(DEVICE.type, enabled=(DEVICE.type=="cuda"), dtype=torch.float16):
+                            h = mdl(**enc).last_hidden_state.mean(1)
+                        tweet_embs.append(h.float().cpu().numpy())
+
+                    # MAX-pool across tweets (captures "spammiest tweet wins")
+                    # ChatGPT diagnostic: mean pooling dilutes rare but decisive spam evidence
+                    user_emb = np.vstack(tweet_embs).max(axis=0).astype(np.float32)
+                    batch_embs.append(user_emb)
+
+                    # Log slow users (> 100 tweets)
+                    if len(user_tweets) > 100:
+                        logger.info(f"    User {user_idx} has {len(user_tweets)} tweets")
+
+                # Write to memmap
+                logger.info(f"  💾 Writing to memmap...")
+                for i, emb in enumerate(batch_embs):
+                    tweet_emb_mm[s + i, :] = emb
+
+                del tweet_texts_per_user, batch_embs
+                gc.collect()
+                logger.info(f"✅ Batch {batch_idx + 1} complete")
+
+            store.close()
+            del tweet_emb_mm  # Close memmap
+            logger.info(f"🎉 Tweet embeddings saved to {tweet_cache}")
+
+        # Load tweet embeddings (from memmap or cache)
+        tweet_emb = np.load(tweet_cache)
+
+        # ----------------------- PROFILE FEATURES ------------------------
+        if not num_cache.exists() or not cat_cache.exists():
+            logger.info("Extracting profile features...")
+            num_props, cat_props = extract_num_cat_props(users)
+            np.save(num_cache, num_props)
+            np.save(cat_cache, cat_props)
+            logger.info("Saved profile features to cache")
+        else:
+            num_props = np.load(num_cache)  # Curtis Oct 6: Load as writable (not mmap)
+            cat_props = np.load(cat_cache)  # Curtis Oct 6: Load as writable (not mmap)
+
+        # ------------------- TEMPORAL FEATURES (STRUCT) ------------------
+        if not temporal_cache.exists():
+            # Select extractor version
+            if USE_TEMPORAL_V2:
+                logger.info("Extracting V2 temporal features (32-dim: circadian + stability)...")
+                from temporal_extractor_v2 import extract_temporal_features_v2
+                extractor_fn = extract_temporal_features_v2
+                norm_dims = 31  # Normalize all except has_tweets bit (last dim)
+            else:
+                logger.info("Extracting V1 temporal features (16-dim: original robust)...")
+                extractor_fn = extract_temporal_features
+                norm_dims = 15  # Original: normalize first 15, skip has_tweets bit
+
+            # MEMMAP EXTRACTION: Process in 50K user batches with memmap output
+            logger.info("🔥 ChatGPT Solution: Memmap temporal extraction (NO RAM EXPLOSION)")
+            from numpy.lib.format import open_memmap
+            from tweet_store import TweetStore
+
+            # Pre-allocate memmap for temporal features
+            N = len(user_ids)
+            temp_dim = 32 if USE_TEMPORAL_V2 else 16
+            temp_mm = open_memmap(temporal_cache, mode="w+", dtype="float32", shape=(N, temp_dim))
+            logger.info(f"✅ Created temporal memmap: {temporal_cache} ({N:,} × {temp_dim})")
+
+            # Ensure dupsort LMDB exists
+            dupsort_lmdb_path = Path("/home/the-architect/Reflexion_ultimate/vigilante/tweets_dupsort.lmdb")
+            if not dupsort_lmdb_path.exists():
+                logger.error(f"❌ Dupsort LMDB not found at {dupsort_lmdb_path}")
+                logger.error("   Run: python build_tweets_lmdb_dupsort.py")
+                raise FileNotFoundError(f"Dupsort LMDB not found. Run build_tweets_lmdb_dupsort.py first.")
+
+            # Open dupsort LMDB
+            store = TweetStore(dupsort_lmdb_path)
+
+            # Process in batches of 50K users
+            BATCH_SIZE = 50000
+            num_batches = (N + BATCH_SIZE - 1) // BATCH_SIZE
+            logger.info(f"Processing {num_batches} batches of {BATCH_SIZE:,} users each")
+
+            for batch_idx in range(num_batches):
+                s = batch_idx * BATCH_SIZE
+                e = min(s + BATCH_SIZE, N)
+                batch_uids = user_ids[s:e]
+
+                logger.info(f"📦 Batch {batch_idx + 1}/{num_batches}: users {s:,} to {e:,}")
+
+                # Extract temporal features for this batch
+                for i, uid in enumerate(tqdm(batch_uids, desc=f"  Temporal batch {batch_idx + 1}", unit="u")):
+                    tweets = list(store.iter_user_tweets(uid))
+                    feats, _ = extractor_fn(tweets)
+                    temp_mm[s + i, :] = feats.astype(np.float32)
+
+                gc.collect()
+                logger.info(f"✅ Temporal batch {batch_idx + 1} complete")
+
+            store.close()
+            del temp_mm  # Close memmap
+            logger.info(f"🎉 Temporal features saved to {temporal_cache}")
+
+            # Load from disk for normalization
+            temporal_feats = np.load(temporal_cache)
+
+            # --- AUDIT: Check temporal feature extraction ---
+            has_tweets_bit_sum = np.sum(temporal_feats[:, 15])
+            logger.info("=" * 60)
+            logger.info("📊 TEMPORAL FEATURE AUDIT")
+            logger.info(f"Sum of 'has_tweets' bit (column 15): {has_tweets_bit_sum:.0f}")
+            logger.info(f"(Should match 'Users Matched with >0 Tweets' above)")
+            mean_feature_val = np.mean(np.abs(temporal_feats[:, :15]))
+            logger.info(f"Mean absolute value of first 15 temporal features: {mean_feature_val:.6f}")
+            if mean_feature_val < 0.001:
+                logger.warning("⚠️ TEMPORAL FEATURES ARE NEAR-ZERO! Model will ignore them!")
+            logger.info("=" * 60)
+
+            # z-score normalize using TRAIN split only (skip has_tweets bit)
+            train_indices = np.where(train_mask.numpy())[0]
+            means = temporal_feats[train_indices, :norm_dims].mean(axis=0)
+            stds  = temporal_feats[train_indices, :norm_dims].std(axis=0)
+            stds  = np.maximum(stds, 1e-6)
+            temporal_feats[:, :norm_dims] = (temporal_feats[:, :norm_dims] - means) / stds
+
+            # --- START FIX ---
+            # After normalization, force features for users without tweets to be true zero
+            no_tweets_mask = temporal_feats[:, 15] == 0
+            temporal_feats[no_tweets_mask, :15] = 0.0
+            logger.info(f"Applied temporal feature zero-out fix to {np.sum(no_tweets_mask)} users")
+            # --- END FIX ---
+
+            np.save(temporal_cache, temporal_feats)
+            (CACHE_DIR / "temporal_norm_v1.json").write_text(json.dumps({"means": means.tolist(), "stds": stds.tolist()}, indent=2))
+            logger.info(f"Saved temporal features to {temporal_cache}")
+            logger.info("Saved normalization params to temporal_norm_v1.json")
+        else:
+            temporal_feats = np.load(temporal_cache)  # Curtis Oct 6: Load as writable (not mmap)
+
+        # --- Sanity: make sure temporal features are not constant zeros ---
+        try:
+            m = np.abs(temporal_feats[:, :15]).mean()
+            s = temporal_feats[:, :15].std(axis=0).mean()
+            nz = int((temporal_feats[:, :15].std(axis=0) > 1e-7).sum())
+            logger.info(f"[TEMP-STATS] mean(|μ|)={m:.4f}  mean(σ)={s:.4f}  nonzero_cols={nz}/15")
+
+            # --- CORRELATION CHECK: temporal vs labels ---
+            train_indices = np.where(train_mask.numpy())[0]
+            temp_train = temporal_feats[train_indices, :15]
+            labels_train = labels[train_indices].numpy()
+
+            # Pearson correlation for each feature
+            correlations = []
+            for col_idx in range(15):
+                feature = temp_train[:, col_idx]
+                # Skip constant features
+                if np.std(feature) < 1e-7:
+                    correlations.append(0.0)
+                    continue
+                # Compute correlation
+                corr = np.corrcoef(feature, labels_train)[0, 1]
+                correlations.append(corr if not np.isnan(corr) else 0.0)
+
+            corr_arr = np.array(correlations)
+            mean_abs_corr = np.abs(corr_arr).mean()
+            max_abs_corr = np.abs(corr_arr).max()
+            top5_idx = np.argsort(np.abs(corr_arr))[-5:][::-1]
+
+            logger.info(f"[CORR-CHECK] Temporal features vs labels:")
+            logger.info(f"  mean(|r|) = {mean_abs_corr:.4f}")
+            logger.info(f"  max(|r|)  = {max_abs_corr:.4f}")
+            logger.info(f"  Top 5 features by |corr|:")
+            feature_names = ["median_gap", "std_gap", "cv_gap", "burst_ratio", "hour_entropy",
+                           "weekend_ratio", "retweet_ratio", "url_ratio", "hashtag_density",
+                           "mention_density", "log_avg_retweets", "log_avg_replies",
+                           "log_avg_likes", "log_engagement_std", "engagement_cv"]
+            for idx in top5_idx:
+                logger.info(f"    [{idx}] {feature_names[idx]:20s} r={corr_arr[idx]:+.4f}")
+
+            if mean_abs_corr < 0.01:
+                logger.warning("⚠️ TEMPORAL FEATURES HAVE NEAR-ZERO CORRELATION WITH LABELS")
+                logger.warning("   → Model cannot learn from them regardless of architecture")
+
+        except Exception as e:
+            logger.warning(f"[TEMP-STATS] could not compute: {e}")
+
+        # Free heavy structures
+        try:
+            del user_id_to_tweets
+        except Exception:
+            pass
+        del users, tweet_text_chunks, user_descriptions
+        gc.collect()
+        check_ram_guard("After feature extraction")
+
+    # Graph
+    graph_data = build_graph(GRAPH_FILE, user_to_idx)
+
+    # ---- RAM OPTIMIZATION: Preload all features as CONTIGUOUS tensors in RAM ----
+    # This eliminates per-batch numpy→torch conversion overhead
+    # Using as_tensor + contiguous() is faster than torch.tensor() for large arrays
+    logger.info("[RAM] Converting feature arrays to contiguous RAM-resident tensors...")
+    full_des = torch.as_tensor(np.asarray(des_emb), dtype=torch.float32).contiguous()
+    full_tweet = torch.as_tensor(np.asarray(tweet_emb), dtype=torch.float32).contiguous()
+    full_num = torch.as_tensor(np.asarray(num_props), dtype=torch.float32).contiguous()
+    full_cat = torch.as_tensor(np.asarray(cat_props), dtype=torch.float32).contiguous()
+
+    # Keep temporal_feats_np for diagnostics, create contiguous tensor
+    temporal_feats_np = np.asarray(temporal_feats)
+    full_temporal = torch.as_tensor(temporal_feats_np, dtype=torch.float32).contiguous()
+    labels_t = labels.contiguous()  # keep on CPU; moved per-batch
+
+    # Delete large numpy arrays to free RAM (keep temporal_feats_np for diagnostics)
+    del des_emb, tweet_emb, num_props, cat_props, temporal_feats
+    gc.collect()
+    check_ram_guard("After tensor conversion")
+    logger.info(f"[RAM] Feature tensors: des={full_des.shape}, tweet={full_tweet.shape}, num={full_num.shape}, cat={full_cat.shape}, temporal={full_temporal.shape}")
+
+    # Model & Train
+    # Model with gating + modality dropout
+    modality_p = float(os.getenv("MODALITY_DROPOUT_P", "0.10"))  # safe default
+    # Dynamically detect temporal feature size
+    TEMPORAL_DIM = full_temporal.shape[1]
+    logger.info(f"[MODEL] Temporal feature dimension: {TEMPORAL_DIM}")
+
+    model = BotRGCN(
+        des_size=768,
+        tweet_size=768,
+        num_prop_size=6,
+        cat_prop_size=3,
+        temporal_size=TEMPORAL_DIM,
+        embed_dim=EMBED_DIM,
+        dropout=DROPOUT,
+        modality_dropout_p=modality_p,
+        temp_gain_init=TEMP_GAIN_INIT,
+        disable_gate=DISABLE_FUSION_GATE
+    ).to(DEVICE)
+
+    # Log diagnostic settings
+    logger.info(f"[DIAGNOSTICS] TEMP_GAIN_INIT={TEMP_GAIN_INIT}")
+    logger.info(f"[DIAGNOSTICS] DISABLE_FUSION_GATE={DISABLE_FUSION_GATE}")
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    # Loss function selection - compute from TRAIN split only (GPT fix)
+    train_labels = labels_t[train_mask]
+    n_human = int((train_labels == 0).sum())
+    n_bot = int((train_labels == 1).sum()) or 1
+    bot_weight = float(n_human / n_bot)
+    logger.info(f"Train split: {n_human:,} humans, {n_bot:,} bots → bot_weight={bot_weight:.3f}")
+
+    if USE_FOCAL_LOSS:
+        # Focal Loss: focuses on hard examples, better for severe imbalance
+        criterion = FocalLoss(alpha=0.75, gamma=2.0)
+        logger.info("Using Focal Loss (alpha=0.75, gamma=2.0) for bot class focus")
+    else:
+        # Standard Cross-Entropy with class weights
+        criterion = nn.CrossEntropyLoss(
+            weight=torch.tensor([1.0, bot_weight], device=DEVICE, dtype=torch.float32)
+        )
+        logger.info(f"Using Cross-Entropy with class weight for bots: {bot_weight:.2f}")
+    results = train_model(
+        model,
+        full_des,
+        full_tweet,
+        full_num,
+        full_cat,
+        full_temporal,  # NEW - torch tensor
+        temporal_feats_np,  # NEW - numpy array for diagnostics
+        graph_data,
+        labels_t,
+        train_mask,
+        val_mask,
+        test_mask,
+        optimizer,
+        criterion,
+        EPOCHS,
+        PATIENCE,
+    )
+
+    # Unpack results dictionary
+    test_f1 = results['test_f1']
+    best_thr = results['best_thr']
+    thr_has = results['thr_has']
+    thr_noh = results['thr_noh']
+    test_auprc = results['test_auprc']
+    overall_f1_2thr = results['overall_f1_2thr']
+    f1_ht = results['f1_ht']
+    f1_noh = results['f1_noh']
+
+    duration = datetime.now() - start_time
+    logger.info(f"Pipeline Complete | Duration: {duration} | Test F1: {test_f1:.3f}")
+
+    # ChatGPT Oct 6: Create inference bundle (single config for deployment)
+    inference_bundle = {
+        "version": "1.0",
+        "trained_at": datetime.now().isoformat(),
+        "duration_seconds": duration.total_seconds(),
+        "model": {
+            "architecture": "BotRGCN",
+            "file": "botrgcn_t16_best.pt",
+            "temporal_dim": 16,
+            "embed_dim": EMBED_DIM,
+            "dropout": DROPOUT
+        },
+        "thresholds": {
+            "global": float(best_thr),
+            "has_tweets": float(thr_has),  # Two-threshold calibration
+            "no_tweets": float(thr_noh)    # Two-threshold calibration
+        },
+        "normalization": {
+            "temporal_params": "temporal_norm_v1.json"
+        },
+        "performance": {
+            "test_f1": float(test_f1),
+            "test_auprc": float(test_auprc),
+            "test_f1_two_threshold": float(overall_f1_2thr),
+            "test_f1_has_tweets": float(f1_ht),
+            "test_f1_no_tweets": float(f1_noh)
+        },
+        "config": {
+            "gate_warmup_epochs": int(os.getenv("GATE_WARMUP", "5")),
+            "seed": int(os.getenv("SEED", "42")),
+            "batch_size": BATCH_SIZE,
+            "learning_rate": LR
+        }
+    }
+
+    bundle_path = CACHE_DIR / "inference_bundle.json"
+    with open(bundle_path, "w") as f:
+        json.dump(inference_bundle, f, indent=2)
+    logger.info(f"✅ Saved inference bundle to {bundle_path}")
+
+    # -- START MODIFICATION (Curtis Oct 6: Timestamp Autopsy Report) --
+    logger.info("\n" + "="*80)
+    logger.info("TIMESTAMP AUTOPSY REPORT")
+    logger.info("="*80)
+    logger.info(f"Total Timestamps Encountered: {total_timestamps_processed:,}")
+    logger.info(f"Total Timestamps Failed to Parse: {total_timestamps_failed:,}")
+    if total_timestamps_processed > 0:
+        failure_rate = (total_timestamps_failed / total_timestamps_processed) * 100
+        logger.info(f"Failure Rate: {failure_rate:.2f}%")
+        if failure_rate > 2.0:
+            logger.error("!!! HIGH FAILURE RATE. Temporal data is unreliable. This is likely the root cause. !!!")
+        else:
+            logger.info("✅ Low failure rate - timestamps are parsing correctly")
+    logger.info("="*80)
+    # -- END MODIFICATION --
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)  # more stable across platforms
+    main()

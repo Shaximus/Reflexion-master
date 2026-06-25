@@ -1,0 +1,679 @@
+"""
+BlasterDataLoader
+
+Loads real ban/survive telemetry from the swarm snapshot Redis store and
+converts it into the exact tensor format that BotRGCN expects for fine-tuning.
+
+Five modalities produced:
+  des       [N, 768]  -- DistilRoBERTa account bio embeddings
+  tweet     [N, 768]  -- DistilRoBERTa tweet-history embeddings
+  num_prop  [N, 6]    -- numeric profile features (StandardScaler)
+  cat_prop  [N, 3]    -- categorical profile features (binary)
+  temporal  [N, 29]   -- temporal/content/engagement/session features (z-score)
+  edge_index[2, E]    -- COO graph edges
+  edge_type [E]       -- 0=following, 1=follower
+  labels    [N]       -- 0=survived, 1=banned
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import redis.asyncio as aioredis
+import torch
+from sklearn.preprocessing import StandardScaler
+
+logger = logging.getLogger("botrgcn_adapter.data_loader")
+
+# ---------------------------------------------------------------------------
+# Path bootstrap: make account_snapshots importable without install
+# ---------------------------------------------------------------------------
+_SERVICES_DIR = Path(__file__).parent.parent
+if str(_SERVICES_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVICES_DIR))
+
+from account_snapshots import TrainingDataExporter, BEHAVIORAL_FEATURE_FIELDS  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Field index lookup (built once at import time)
+# ---------------------------------------------------------------------------
+_F = {name: idx for idx, name in enumerate(BEHAVIORAL_FEATURE_FIELDS)}
+
+
+def _safe_div(a: float, b: float, default: float = 0.0) -> float:
+    return a / b if b > 1e-9 else default
+
+
+class BlasterDataLoader:
+    """
+    Loads swarm telemetry from Redis and prepares BotRGCN-formatted tensors.
+
+    Usage::
+
+        loader = BlasterDataLoader()
+        export  = await loader.load_from_snapshots()
+        tensors = loader.prepare_botrgcn_tensors(export)
+    """
+
+    def __init__(
+        self,
+        redis_host: str = "localhost",
+        redis_port: int = 6379,
+        redis_password: str = os.environ.get("REDIS_PASSWORD", ""),
+    ) -> None:
+        self.redis_host = redis_host
+        self.redis_port = redis_port
+        self.redis_password = redis_password
+
+        self._tokenizer = None
+        self._text_model = None
+        self._text_device: Optional[str] = None
+
+        self._temporal_norm: Optional[Dict[str, Any]] = None
+        self._num_scaler: Optional[StandardScaler] = None
+
+    # ------------------------------------------------------------------
+    # Public: load from Redis
+    # ------------------------------------------------------------------
+
+    async def load_from_snapshots(self, min_age_hours: float = 24.0) -> Dict[str, Any]:
+        """Pull all ban events + survivor snapshots from Redis."""
+        redis = aioredis.Redis(
+            host=self.redis_host,
+            port=self.redis_port,
+            password=self.redis_password,
+            decode_responses=True,
+        )
+        try:
+            exporter = TrainingDataExporter(redis)
+
+            logger.info("Fetching training data from Redis snapshots...")
+            export = await exporter.export_training_data(min_age_hours=min_age_hours)
+
+            logger.info("Fetching graph data from Redis snapshots...")
+            graph = await exporter.export_graph_data()
+
+            logger.info("Fetching identity snapshots for bio text...")
+            identity_export = await exporter.export_identity_features()
+
+            export["graph"] = graph
+            export["identity_raw"] = identity_export.get("raw_snapshots", [])
+
+            logger.info(
+                "Loaded: banned=%d survived=%d nodes=%d edges=%d",
+                len(export.get("banned", [])),
+                len(export.get("survived", [])),
+                len(graph.get("nodes", [])),
+                len(graph.get("edges", [])),
+            )
+        finally:
+            await redis.aclose()
+
+        return export
+
+    # ------------------------------------------------------------------
+    # Public: convert to BotRGCN tensors
+    # ------------------------------------------------------------------
+
+    def prepare_botrgcn_tensors(self, export_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert raw export dict to the 7 tensors BotRGCN.forward() expects,
+        plus labels and aligned account_ids.
+
+        Returns dict with keys: des, tweet, num_prop, cat_prop, temporal,
+        edge_index, edge_type, labels, account_ids, N, norm_params.
+        """
+        features: np.ndarray = export_data["features"]
+        labels: np.ndarray   = export_data["labels"]
+        account_ids: List[str] = export_data["account_ids"]
+        N = len(account_ids)
+
+        if N == 0:
+            logger.warning("Empty dataset -- returning zero-shaped tensors")
+            return self._empty_tensors()
+
+        logger.info("Preparing BotRGCN tensors for N=%d accounts", N)
+
+        # 1. Temporal [N, 29]
+        temporal_raw = self._build_temporal_matrix(features, account_ids)
+        temporal_normed, norm_params = self._normalize_temporal(temporal_raw)
+
+        # 2. Numeric profile [N, 6]
+        num_prop_raw = self._build_num_prop_matrix(features, account_ids)
+        num_prop_scaled, scaler = self._scale_num_prop(num_prop_raw)
+
+        # 3. Categorical profile [N, 3]
+        cat_prop = self._build_cat_prop_matrix(export_data, account_ids)
+
+        # 4. Text embeddings [N, 768] each
+        bio_texts   = self._collect_bio_texts(export_data, account_ids)
+        tweet_texts = self._collect_tweet_texts(export_data, account_ids)
+
+        logger.info("Encoding bios with DistilRoBERTa...")
+        des_emb   = self._encode_text(bio_texts,   batch_size=32)
+
+        logger.info("Encoding tweet histories with DistilRoBERTa...")
+        tweet_emb = self._encode_text(tweet_texts, batch_size=32)
+
+        # 5. Graph [2, E] / [E]
+        edge_index, edge_type = self._build_graph(export_data, account_ids)
+
+        self._temporal_norm = norm_params
+        self._num_scaler = scaler
+
+        result = {
+            "des":        torch.from_numpy(des_emb).float(),
+            "tweet":      torch.from_numpy(tweet_emb).float(),
+            "num_prop":   torch.from_numpy(num_prop_scaled).float(),
+            "cat_prop":   torch.from_numpy(cat_prop).float(),
+            "temporal":   torch.from_numpy(temporal_normed).float(),
+            "edge_index": edge_index,
+            "edge_type":  edge_type,
+            "labels":     torch.from_numpy(labels.astype(np.int64)),
+            "account_ids": account_ids,
+            "N": N,
+            "norm_params": norm_params,
+        }
+
+        logger.info(
+            "Tensor shapes: des=%s tweet=%s num=%s cat=%s temporal=%s "
+            "edge_index=%s edge_type=%s labels=%s",
+            tuple(result["des"].shape),
+            tuple(result["tweet"].shape),
+            tuple(result["num_prop"].shape),
+            tuple(result["cat_prop"].shape),
+            tuple(result["temporal"].shape),
+            tuple(result["edge_index"].shape) if result["edge_index"] is not None else None,
+            tuple(result["edge_type"].shape)  if result["edge_type"]  is not None else None,
+            tuple(result["labels"].shape),
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal: temporal feature mapping
+    # ------------------------------------------------------------------
+
+    def _build_temporal_matrix(
+        self, features: np.ndarray, account_ids: List[str]
+    ) -> np.ndarray:
+        """
+        Map 42-dim snapshot features -> 29-dim BotRGCN temporal vector.
+
+        Slot mapping (mirrors extract_temporal_features in original):
+          [0]  median_gap      = avg_gap_seconds / 60 (seconds to minutes)
+          [1]  std_gap         = sqrt(gap_variance) / 60
+          [2]  cv_gap          = std_gap / (median_gap + 1e-6)
+          [3]  burst_ratio     = (burst_count+1) / (total_tweets+2) Laplace
+          [4]  hour_entropy    = direct
+          [5]  weekend_ratio   = direct
+          [6]  retweet_ratio   = (retweet_count+1) / (total_tweets+2) Laplace
+          [7]  url_ratio       = direct
+          [8]  hashtag_density = direct
+          [9]  mention_density = direct
+          [10] log1p(total_retweets_received / total_tweets)
+          [11] log1p(total_replies_received  / total_tweets)
+          [12] log1p(total_likes_received    / total_tweets)
+          [13] log1p(sqrt(engagement_variance))
+          [14] engagement_cv
+          [15] has_tweets bit
+
+        Session / social graph / red flag slots [16-28]:
+          [16] session_action_diversity  (direct)
+          [17] avg_dwell_time_ms / 1000  (ms -> seconds for scale)
+          [18] session_duration_cv       (direct)
+          [19] impression_action_ratio   (direct, capped at 100)
+          [20] avg_actions_per_session   (direct)
+          [21] scroll_impression_ratio   (direct, 0-1)
+          [22] follow_velocity_per_day   (direct)
+          [23] unfollow_ratio            (direct, 0-1)
+          [24] reply_thread_depth_avg    (direct)
+          [25] follow_back_ratio         (direct, 0-1)
+          [26] rate_limit_events_per_day (direct)
+          [27] error_rate                (direct, 0-1)
+          [28] ad_impression_ratio       (direct, 0-1)
+        """
+        N = len(account_ids)
+        T = np.zeros((N, 29), dtype=np.float32)
+
+        for i in range(N):
+            row = features[i]
+
+            total_tw_raw = float(row[_F["total_tweets"]])
+            total_tw     = total_tw_raw + 1e-9
+
+            avg_gap_s    = float(row[_F["avg_gap_between_tweets_seconds"]])
+            gap_var      = float(row[_F["gap_variance"]])
+            median_gap   = avg_gap_s / 60.0
+            std_gap      = math.sqrt(max(gap_var, 0.0)) / 60.0
+            cv_gap       = std_gap / (median_gap + 1e-6)
+
+            burst_count  = float(row[_F["burst_count"]])
+            burst_ratio  = (burst_count + 1.0) / (total_tw + 2.0)
+
+            hour_entropy  = float(row[_F["hour_entropy"]])
+            weekend_ratio = float(row[_F["weekend_ratio"]])
+
+            rt_count      = float(row[_F["retweet_count"]])
+            retweet_ratio = (rt_count + 1.0) / (total_tw + 2.0)
+            url_ratio     = float(row[_F["url_ratio"]])
+            hashtag_den   = float(row[_F["hashtag_density"]])
+            mention_den   = float(row[_F["mention_density"]])
+
+            total_rt      = float(row[_F["total_retweets_received"]])
+            total_rep     = float(row[_F["total_replies_received"]])
+            total_lk      = float(row[_F["total_likes_received"]])
+            eng_var       = float(row[_F["engagement_variance"]])
+
+            log_rt        = math.log1p(total_rt  / total_tw)
+            log_rep       = math.log1p(total_rep / total_tw)
+            log_lk        = math.log1p(total_lk  / total_tw)
+            log_eng_std   = math.log1p(math.sqrt(max(eng_var, 0.0)))
+
+            avg_eng       = (total_rt + total_rep + total_lk) / total_tw
+            eng_cv        = _safe_div(math.sqrt(max(eng_var, 0.0)), avg_eng + 1e-6)
+
+            has_tweets    = 1.0 if total_tw_raw > 0 else 0.0
+
+            # Session behavior (Scribe-aware) [16-21]
+            sess_diversity   = float(row[_F["session_action_diversity"]])
+            dwell_sec        = float(row[_F["avg_dwell_time_ms"]]) / 1000.0
+            sess_cv          = float(row[_F["session_duration_cv"]])
+            imp_act_ratio    = min(float(row[_F["impression_action_ratio"]]), 100.0)
+            actions_per_sess = float(row[_F["avg_actions_per_session"]])
+            scroll_imp       = float(row[_F["scroll_impression_ratio"]])
+
+            # Social graph dynamics [22-25]
+            follow_vel       = float(row[_F["follow_velocity_per_day"]])
+            unfollow_r       = float(row[_F["unfollow_ratio"]])
+            thread_depth     = float(row[_F["reply_thread_depth_avg"]])
+            followback_r     = float(row[_F["follow_back_ratio"]])
+
+            # Red flag indicators [26-28]
+            rl_events        = float(row[_F["rate_limit_events_per_day"]])
+            err_rate         = float(row[_F["error_rate"]])
+            ad_imp_ratio     = float(row[_F["ad_impression_ratio"]])
+
+            T[i] = [
+                median_gap, std_gap, cv_gap, burst_ratio,
+                hour_entropy, weekend_ratio,
+                retweet_ratio, url_ratio, hashtag_den, mention_den,
+                log_rt, log_rep, log_lk, log_eng_std, eng_cv,
+                has_tweets,
+                sess_diversity, dwell_sec, sess_cv, imp_act_ratio,
+                actions_per_sess, scroll_imp,
+                follow_vel, unfollow_r, thread_depth, followback_r,
+                rl_events, err_rate, ad_imp_ratio,
+            ]
+
+        return T
+
+    def _normalize_temporal(
+        self, T: np.ndarray, train_indices: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Z-score normalize continuous cols; leave binary col 15 (has_tweets) raw.
+
+        Continuous columns: 0-14 (original) and 16-28 (new session/social/redflag).
+        Binary column 15 (has_tweets) is preserved untouched.
+
+        If train_indices is provided, compute means/stds from training
+        rows only but apply the normalization to ALL rows (prevents
+        data leakage from validation/test set into normalization stats).
+        """
+        normed = T.copy()
+        N = T.shape[0]
+
+        # All continuous columns: skip binary bit at index 15
+        continuous_cols = list(range(0, 15)) + list(range(16, 29))
+        n_continuous = len(continuous_cols)
+
+        if N > 1:
+            if train_indices is not None and len(train_indices) > 1:
+                means = T[np.ix_(train_indices, continuous_cols)].mean(axis=0)
+                stds  = T[np.ix_(train_indices, continuous_cols)].std(axis=0)
+            else:
+                means = T[:, continuous_cols].mean(axis=0)
+                stds  = T[:, continuous_cols].std(axis=0)
+        else:
+            means = np.zeros(n_continuous, dtype=np.float32)
+            stds  = np.ones(n_continuous,  dtype=np.float32)
+
+        stds = np.where(stds < 1e-9, 1.0, stds)
+        normed[:, continuous_cols] = (T[:, continuous_cols] - means) / stds
+
+        norm_params: Dict[str, Any] = {
+            "means":           means.tolist(),
+            "stds":            stds.tolist(),
+            "continuous_cols": continuous_cols,
+            "version":         "adversarial_v2",
+        }
+        return normed.astype(np.float32), norm_params
+
+    # ------------------------------------------------------------------
+    # Internal: numeric profile mapping
+    # ------------------------------------------------------------------
+
+    def _build_num_prop_matrix(
+        self, features: np.ndarray, account_ids: List[str]
+    ) -> np.ndarray:
+        """
+        [0] follower_count
+        [1] following_count
+        [2] total_likes_received  (favourites_count proxy)
+        [3] total_tweets          (tweet_count)
+        [4] len(account_id)       (username length proxy)
+        [5] account_age_hours / 24 (age_days)
+        """
+        N = len(account_ids)
+        P = np.zeros((N, 6), dtype=np.float32)
+        for i, aid in enumerate(account_ids):
+            row = features[i]
+            P[i, 0] = float(row[_F["follower_count"]])
+            P[i, 1] = float(row[_F["following_count"]])
+            P[i, 2] = float(row[_F["total_likes_received"]])
+            P[i, 3] = float(row[_F["total_tweets"]])
+            P[i, 4] = float(len(aid))
+            P[i, 5] = float(row[_F["account_age_hours"]]) / 24.0
+        return P
+
+    def _scale_num_prop(
+        self, P: np.ndarray, train_indices: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, StandardScaler]:
+        """Fit StandardScaler on numeric profile props.
+
+        If train_indices is provided, fit on training rows only but
+        transform ALL rows (prevents data leakage).
+        """
+        scaler = StandardScaler()
+        if P.shape[0] > 1:
+            if train_indices is not None and len(train_indices) > 1:
+                scaler.fit(P[train_indices])
+            else:
+                scaler.fit(P)
+            P_scaled = scaler.transform(P).astype(np.float32)
+        else:
+            scaler.fit(P)
+            P_scaled = P.astype(np.float32)
+        return P_scaled, scaler
+
+    # ------------------------------------------------------------------
+    # Internal: categorical profile mapping
+    # ------------------------------------------------------------------
+
+    def _build_cat_prop_matrix(
+        self, export_data: Dict[str, Any], account_ids: List[str]
+    ) -> np.ndarray:
+        """
+        [0] 0.0  -- swarm accounts are never verified
+        [1] 0.0  -- swarm accounts are public (not protected)
+        [2] has_bio from identity snapshot (1.0 / 0.0)
+        """
+        has_bio_map: Dict[str, float] = {}
+        for identity_dict in export_data.get("identity_raw", []):
+            aid = identity_dict.get("account_id", "")
+            if aid:
+                has_bio_map[aid] = 1.0 if identity_dict.get("has_bio", False) else 0.0
+
+        N = len(account_ids)
+        C = np.zeros((N, 3), dtype=np.float32)
+        for i, aid in enumerate(account_ids):
+            C[i, 0] = 0.0
+            C[i, 1] = 0.0
+            C[i, 2] = has_bio_map.get(aid, 0.0)
+        return C
+
+    # ------------------------------------------------------------------
+    # Internal: text collection for embedding
+    # ------------------------------------------------------------------
+
+    def _collect_bio_texts(
+        self, export_data: Dict[str, Any], account_ids: List[str]
+    ) -> List[str]:
+        """Return empty strings for all accounts.
+        AccountIdentitySnapshot stores has_bio (bool) but not actual bio text.
+        Empty string -> zero vector, which the model handles gracefully.
+        """
+        return [""] * len(account_ids)
+
+    def _collect_tweet_texts(
+        self, export_data: Dict[str, Any], account_ids: List[str]
+    ) -> List[str]:
+        """
+        Construct a synthetic behavioral text per account for DistilRoBERTa.
+        The snapshot module stores aggregated stats, not raw tweet text, so we
+        encode behavioral signals as descriptive prose.
+        """
+        features: np.ndarray = export_data["features"]
+        aid_to_idx: Dict[str, int] = {
+            aid: i for i, aid in enumerate(export_data["account_ids"])
+        }
+
+        texts: List[str] = []
+        for aid in account_ids:
+            idx = aid_to_idx.get(aid)
+            if idx is None:
+                texts.append("")
+                continue
+
+            row = features[idx]
+            total    = int(row[_F["total_tweets"]])
+            rt_cnt   = int(row[_F["retweet_count"]])
+            orig_cnt = int(row[_F["original_tweet_count"]])
+            url_r    = float(row[_F["url_ratio"]])
+            ht_den   = float(row[_F["hashtag_density"]])
+            men_den  = float(row[_F["mention_density"]])
+
+            synthetic = (
+                f"Account activity: {total} tweets total. "
+                f"{orig_cnt} original, {rt_cnt} retweets. "
+                f"URL ratio {url_r:.2f}, hashtag density {ht_den:.2f}, "
+                f"mention density {men_den:.2f}."
+            )
+            texts.append(synthetic)
+
+        return texts
+
+    # ------------------------------------------------------------------
+    # Internal: text encoding
+    # ------------------------------------------------------------------
+
+    def _ensure_text_model(self, device: Optional[str] = None) -> None:
+        """Lazy-load DistilRoBERTa; falls back to CPU on CUDA OOM."""
+        if self._tokenizer is not None:
+            return
+
+        from transformers import AutoModel, AutoTokenizer  # noqa: PLC0415
+
+        model_name = "distilroberta-base"
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        logger.info("Loading %s on %s...", model_name, device)
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        try:
+            self._text_model = (
+                AutoModel.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                )
+                .to(device)
+                .eval()
+            )
+            self._text_device = device
+        except RuntimeError:
+            logger.warning("CUDA OOM loading text model; falling back to CPU")
+            self._text_model = (
+                AutoModel.from_pretrained(model_name, torch_dtype=torch.float32)
+                .to("cpu")
+                .eval()
+            )
+            self._text_device = "cpu"
+
+        logger.info("Text model loaded on %s", self._text_device)
+
+    def _encode_text(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        """
+        Batch-encode texts with DistilRoBERTa -> [N, 768] float32.
+        Empty texts produce zero vectors.
+        """
+        self._ensure_text_model()
+        device    = self._text_device
+        use_amp   = (device == "cuda")
+        N         = len(texts)
+        embeddings = np.zeros((N, 768), dtype=np.float32)
+
+        for start in range(0, N, batch_size):
+            batch_texts = texts[start : start + batch_size]
+            cleaned     = [t if t.strip() else " " for t in batch_texts]
+            empty_mask  = [not t.strip() for t in batch_texts]
+
+            try:
+                inputs = self._tokenizer(
+                    cleaned,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=128,
+                    padding=True,
+                )
+                inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+
+                with torch.no_grad():
+                    if use_amp:
+                        with torch.autocast("cuda", dtype=torch.float16):
+                            hidden = self._text_model(**inputs).last_hidden_state
+                    else:
+                        hidden = self._text_model(**inputs).last_hidden_state
+                    vecs = hidden.mean(dim=1).to("cpu", non_blocking=True).float().numpy()
+
+                for j, (is_empty, vec) in enumerate(zip(empty_mask, vecs)):
+                    embeddings[start + j] = 0.0 if is_empty else vec
+
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower() and device == "cuda":
+                    logger.warning("CUDA OOM during text encoding batch %d; retrying on CPU", start)
+                    torch.cuda.empty_cache()
+                    inputs_cpu = self._tokenizer(
+                        cleaned,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=128,
+                        padding=True,
+                    )
+                    model_cpu = self._text_model.to("cpu")
+                    with torch.no_grad():
+                        hidden_cpu = model_cpu(**inputs_cpu).last_hidden_state
+                        vecs_cpu = hidden_cpu.mean(dim=1).float().numpy()
+                    self._text_model.to(device)
+                    for j, (is_empty, vec) in enumerate(zip(empty_mask, vecs_cpu)):
+                        embeddings[start + j] = 0.0 if is_empty else vec
+                else:
+                    logger.error("Text encoding error in batch %d: %s", start, exc)
+
+            if (start // batch_size) % 10 == 0:
+                logger.debug("Encoded %d/%d texts", min(start + batch_size, N), N)
+
+        return embeddings
+
+    # ------------------------------------------------------------------
+    # Internal: graph construction
+    # ------------------------------------------------------------------
+
+    def _build_graph(
+        self, export_data: Dict[str, Any], account_ids: List[str]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert export_graph_data() output to edge_index [2,E] / edge_type [E].
+        Relation 0 = following / swarm_to_swarm, 1 = follower.
+        Falls back to self-loops when no edges exist.
+        """
+        graph      = export_data.get("graph", {})
+        nodes      = graph.get("nodes", [])
+        raw_edges  = graph.get("edges", [])
+        raw_etypes = graph.get("edge_types", [])
+
+        N = len(account_ids)
+
+        if not raw_edges:
+            logger.info("Empty graph -- using self-loop placeholder edges")
+            idx = torch.arange(N, dtype=torch.long)
+            return torch.stack([idx, idx], dim=0), torch.zeros(N, dtype=torch.long)
+
+        all_nodes   = list(dict.fromkeys(account_ids + list(nodes)))
+        node_to_idx = {n: i for i, n in enumerate(all_nodes)}
+
+        src_list: List[int] = []
+        dst_list: List[int] = []
+        et_list:  List[int] = []
+
+        for edge, etype in zip(raw_edges, raw_etypes):
+            if not isinstance(edge, (list, tuple)) or len(edge) < 2:
+                continue
+
+            src_id, dst_id = edge[0], edge[1]
+
+            if isinstance(src_id, int) and isinstance(dst_id, int):
+                src_node = nodes[src_id] if src_id < len(nodes) else None
+                dst_node = nodes[dst_id] if dst_id < len(nodes) else None
+            else:
+                src_node = str(src_id)
+                dst_node = str(dst_id)
+
+            if src_node is None or dst_node is None:
+                continue
+
+            si = node_to_idx.get(src_node)
+            di = node_to_idx.get(dst_node)
+            if si is None or di is None:
+                continue
+
+            if isinstance(etype, int):
+                rel = min(int(etype), 1)
+            elif "follower" in str(etype) and "following" not in str(etype):
+                rel = 1
+            else:
+                rel = 0
+
+            src_list.append(si)
+            dst_list.append(di)
+            et_list.append(rel)
+
+        if not src_list:
+            idx = torch.arange(N, dtype=torch.long)
+            return torch.stack([idx, idx], dim=0), torch.zeros(N, dtype=torch.long)
+
+        edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+        edge_type  = torch.tensor(et_list, dtype=torch.long)
+        logger.info("Graph: %d nodes, %d edges", len(all_nodes), len(src_list))
+        return edge_index, edge_type
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _empty_tensors() -> Dict[str, Any]:
+        return {
+            "des":         torch.zeros(0, 768),
+            "tweet":       torch.zeros(0, 768),
+            "num_prop":    torch.zeros(0, 6),
+            "cat_prop":    torch.zeros(0, 3),
+            "temporal":    torch.zeros(0, 29),
+            "edge_index":  torch.zeros(2, 0, dtype=torch.long),
+            "edge_type":   torch.zeros(0, dtype=torch.long),
+            "labels":      torch.zeros(0, dtype=torch.long),
+            "account_ids": [],
+            "N":           0,
+            "norm_params": {},
+        }
+
+    def get_temporal_norm_params(self) -> Optional[Dict[str, Any]]:
+        return self._temporal_norm
+
+    def get_num_scaler(self) -> Optional[StandardScaler]:
+        return self._num_scaler

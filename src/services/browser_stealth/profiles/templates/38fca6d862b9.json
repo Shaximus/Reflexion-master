@@ -1,0 +1,53 @@
+{
+  "name": "macOS Safari M2",
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+  "screen": {
+    "width": 2560,
+    "height": 1664,
+    "colorDepth": 30,
+    "pixelDepth": 30
+  },
+  "viewport": {
+    "width": 1440,
+    "height": 821
+  },
+  "timezone": "America/Chicago",
+  "languages": [
+    "en-US",
+    "en"
+  ],
+  "geolocation": {
+    "lat": 41.8781,
+    "lon": -87.6298,
+    "accuracy": 100
+  },
+  "webgl_vendor": "Apple Inc.",
+  "webgl_renderer": "Apple M2",
+  "device_memory": 8,
+  "hardware_concurrency": 8,
+  "platform": "MacIntel",
+  "fonts": [
+    "Arial",
+    "Courier",
+    "Courier New",
+    "Geneva",
+    "Georgia",
+    "Helvetica",
+    "Helvetica Neue",
+    "Lucida Grande",
+    "Monaco",
+    "Palatino",
+    "San Francisco",
+    "Times",
+    "Times New Roman",
+    "Trebuchet MS",
+    "Verdana"
+  ],
+  "vendor": "Apple Computer, Inc.",
+  "ua_brands": [],
+  "ua_platform": "macOS",
+  "ua_platform_version": "14.7.1",
+  "ua_architecture": "arm",
+  "ua_full_version_list": [],
+  "profile_id": "template_38fca6d862b9"
+}

@@ -1,0 +1,23 @@
+{
+  "session_id": "20250807_224844",
+  "timestamp": "2025-08-07T22:49:32.755499",
+  "args": {
+    "headless": true,
+    "use_mocks": true,
+    "log_dir": "debug_logs",
+    "test_all": true,
+    "test_browser": false,
+    "test_cloudflare": false,
+    "test_elements": false,
+    "test_flow": false,
+    "dry_run": false,
+    "mock_captcha_fail": false,
+    "mock_sms_fail": false
+  },
+  "test_results": {
+    "browser_launch": true,
+    "cloudflare": true,
+    "twitter_elements": false,
+    "full_flow": false
+  }
+}

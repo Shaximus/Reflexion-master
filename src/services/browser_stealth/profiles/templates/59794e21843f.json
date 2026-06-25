@@ -1,0 +1,74 @@
+{
+  "name": "Win10 Chrome 768p UHD620",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "screen": {
+    "width": 1366,
+    "height": 768,
+    "colorDepth": 24,
+    "pixelDepth": 24
+  },
+  "viewport": {
+    "width": 1366,
+    "height": 657
+  },
+  "timezone": "America/Chicago",
+  "languages": [
+    "en-US",
+    "en"
+  ],
+  "geolocation": {
+    "lat": 41.8781,
+    "lon": -87.6298,
+    "accuracy": 150
+  },
+  "webgl_vendor": "Google Inc. (Intel)",
+  "webgl_renderer": "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11-27.20.100.8681)",
+  "device_memory": 8,
+  "hardware_concurrency": 4,
+  "platform": "Win32",
+  "fonts": [
+    "Arial",
+    "Calibri",
+    "Cambria",
+    "Consolas",
+    "Courier New",
+    "Georgia",
+    "Segoe UI",
+    "Tahoma",
+    "Times New Roman",
+    "Verdana"
+  ],
+  "vendor": "Google Inc.",
+  "ua_brands": [
+    {
+      "brand": "Chromium",
+      "version": "131"
+    },
+    {
+      "brand": "Google Chrome",
+      "version": "131"
+    },
+    {
+      "brand": "Not_A Brand",
+      "version": "24"
+    }
+  ],
+  "ua_platform": "Windows",
+  "ua_platform_version": "10.0.0",
+  "ua_architecture": "x86",
+  "ua_full_version_list": [
+    {
+      "brand": "Chromium",
+      "version": "131.0.6778.86"
+    },
+    {
+      "brand": "Google Chrome",
+      "version": "131.0.6778.86"
+    },
+    {
+      "brand": "Not_A Brand",
+      "version": "24.0.0.0"
+    }
+  ],
+  "profile_id": "template_59794e21843f"
+}

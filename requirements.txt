@@ -1,0 +1,47 @@
+# Core API clients
+openai
+anthropic
+google-generativeai
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+fastapi
+
+# Twitter/X APIs
+tweepy
+
+# Memory and embeddings
+qdrant-client
+sentence-transformers
+
+# Async and networking
+aiohttp
+requests
+httpx
+websockets
+
+# Environment and configuration
+python-dotenv
+
+# Data processing
+numpy
+pandas
+
+# Utilities
+faker
+beautifulsoup4
+lxml
+
+# Security and auth
+cryptography
+pyjwt
+
+# Image handling (if needed for memes/visual content)
+Pillow
+
+# Rate limiting and caching
+cachetools
+
+# Logging and monitoring
+colorlog

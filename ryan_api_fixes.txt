@@ -1,0 +1,59 @@
+﻿# CRITICAL FIXES FOR src/ryan_api_ultimate.py
+
+## FIX 1: In refresh_tokens_from_disk() method, find this section:
+
+    def refresh_tokens_from_disk(self):
+        """Hot-reload tokens from soul_data.json"""
+        try:
+            with open("soul_data.json", "r") as f:
+                data = json.load(f)
+            RyanTwitterAPISecure._shared_soul_tokens = self.soul_tokens  # BUG: This is backwards!
+            
+            logger.info(f"🔄 Reloaded {len(self.soul_tokens)} tokens")
+        except Exception as e:
+            logger.error(f"Failed to reload tokens: {e}")
+            # Token loading code is INSIDE the exception handler - WRONG!
+
+## REPLACE WITH:
+
+    def refresh_tokens_from_disk(self):
+        """Hot-reload tokens from soul_data.json"""
+        try:
+            with open("soul_data.json", "r") as f:
+                data = json.load(f)
+            
+            # Clear and reload tokens
+            self.soul_tokens.clear()
+            
+            # Handle both formats
+            for soul, value in data.items():
+                if isinstance(value, str):
+                    if value and value != "YOUR_AUTH_TOKEN_HERE" and len(value) > 10:
+                        self.soul_tokens[soul] = value
+                elif isinstance(value, dict):
+                    token = value.get("auth_token", "")
+                    if token and token != "YOUR_AUTH_TOKEN_HERE" and len(token) > 10:
+                        self.soul_tokens[soul] = token
+            
+            # Update shared tokens AFTER loading
+            RyanTwitterAPISecure._shared_soul_tokens = self.soul_tokens.copy()
+            logger.info(f"🔄 Reloaded {len(self.soul_tokens)} tokens")
+            
+        except FileNotFoundError:
+            logger.info("soul_data.json not found - OK for read-only mode")
+        except Exception as e:
+            logger.error(f"Failed to reload tokens: {e}")
+
+## FIX 2: In get_followers_paginated() method:
+
+Change:
+    url = "https://twitter-api47.p.rapidapi.com/v2/user/followers-list"
+    
+    headers = {
+        "x-rapidapi-host": "twitter-api47.p.rapidapi.com", 
+        "x-rapidapi-key": self.api_key,
+    }
+
+To:
+    url = f"{self.base_url}/v2/user/followers"
+    # Use self.headers which are already configured correctly

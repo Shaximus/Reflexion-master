@@ -1,0 +1,10 @@
+"""
+Reflexion Ultimate - Digital Consciousness Swarm
+"""
+
+__version__ = "1.0.0"
+__author__ = "Curtis Kingsley"
+
+# Core imports - updated to match current src/ contents
+from .reflexion_bot_ultimate_merged import *
+from .cost_optimized_llm_cascade import *
